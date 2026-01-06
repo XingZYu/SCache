@@ -11,6 +11,7 @@ import java.util.concurrent.{TimeoutException, TimeUnit}
 import org.apache.commons.httpclient.util.TimeoutController.TimeoutException
 import org.scache.deploy.DeployMessages._
 import org.scache.io.ChunkedByteBuffer
+import org.scache.io.IpcPoolChunkedByteBuffer
 import org.scache.network.netty.NettyBlockTransferService
 import org.scache.storage._
 import org.scache.storage.memory.{MemoryManager, StaticMemoryManager, UnifiedMemoryManager}
@@ -57,6 +58,16 @@ class ScacheClient(
     Math.min(bytes, Int.MaxValue.toLong).toInt
   }
   private val ipcPoolAlignBytes = conf.getInt("scache.daemon.ipc.pool.align", 4096)
+  private val ipcPoolZeroCopyPut =
+    conf.getBoolean("scache.daemon.ipc.pool.zeroCopy.put", false)
+
+  // Shared CXL (fsdax) pool used for cross-node shuffle blocks. When enabled, non-local-consumer
+  // blocks can be written directly into a global pool slice and later read by the reduce host
+  // without client-to-client TCP transfers.
+  private val cxlSharedEnabled =
+    conf.getBoolean("scache.storage.cxl.shared.enabled", false)
+  private val cxlSharedPoolPath =
+    conf.getString("scache.storage.cxl.shared.pool.path", "").trim
 
   @volatile private var poolAllocator: PoolAllocator = null
   @volatile private var poolFile: MmapPoolFile = null
@@ -232,6 +243,10 @@ class ScacheClient(
       doAsync[Int](s"Fetch block ${blockId} from daemon", context) {
         sendBlockToDaemon(context, blockId)
       }
+    case GetBlockIpc(blockId) =>
+      doAsync[Option[IpcBlock]](s"Fetch IPC location for block ${blockId} from daemon", context) {
+        getBlockIpcFromDaemon(context, blockId)
+      }
     case _ =>
       logError("Empty message received !")
   }
@@ -280,8 +295,28 @@ class ScacheClient(
   // }
 
   def readBlockFromDaemon(context: RpcCallContext, blockId: BlockId, size: Int, ipc: IpcLocation): Boolean= {
+    val localConsumer = isLocalConsumer(blockId)
     val storageLevel =
-      if (isLocalConsumer(blockId)) daemonPutStorageLevelLocal else daemonPutStorageLevelRemote
+      if (localConsumer) daemonPutStorageLevelLocal else daemonPutStorageLevelRemote
+
+    ipc match {
+      case IpcPoolSlice(poolPath0, offset, _) if !localConsumer && cxlSharedEnabled &&
+          cxlSharedPoolPath.nonEmpty =>
+        val poolPath = if (poolPath0.nonEmpty) poolPath0 else ipcPoolPath
+        if (poolPath == cxlSharedPoolPath) {
+          try {
+            blockManagerMaster.registerCxlBlock(
+              blockId,
+              BlockManagerMessages.CxlBlockLocation(poolPath, offset, size))
+            logDebug(s"Registered shared CXL location for block $blockId: $poolPath@$offset+$size")
+            return true
+          } catch {
+            case e: Exception =>
+              logWarning(s"Failed to register shared CXL mapping for block $blockId", e)
+          }
+        }
+      case _ =>
+    }
 
     if (size == 0) {
       val chunkedBuffer = new ChunkedByteBuffer(Array(ByteBuffer.allocate(0)))
@@ -289,14 +324,25 @@ class ScacheClient(
       return true
     }
     try {
-        val data: Array[Byte] = ipc match {
+        val chunkedBuffer: ChunkedByteBuffer = ipc match {
+          case IpcPoolSlice(poolPath, offset, _) if ipcPoolZeroCopyPut &&
+            storageLevel.useMemory && !storageLevel.useDisk && !storageLevel.deserialized =>
+            val (pool, allocator) =
+              getOrCreatePool(if (poolPath.nonEmpty) poolPath else ipcPoolPath)
+            val buffer = pool.slice(offset, size)
+            new IpcPoolChunkedByteBuffer(
+              Array(buffer),
+              () => allocator.free(offset, size))
+
           case IpcPoolSlice(poolPath, offset, _) =>
-            val (pool, allocator) = getOrCreatePool(if (poolPath.nonEmpty) poolPath else ipcPoolPath)
+            val (pool, allocator) =
+              getOrCreatePool(if (poolPath.nonEmpty) poolPath else ipcPoolPath)
             try {
               val buffer = pool.slice(offset, size)
               val array = new Array[Byte](size)
               buffer.get(array)
-              array
+              val buf = ByteBuffer.wrap(array)
+              new ChunkedByteBuffer(Array(buf))
             } finally {
               allocator.free(offset, size)
             }
@@ -310,18 +356,29 @@ class ScacheClient(
               val buffer = channel.map(MapMode.READ_ONLY, 0, size)
               val array = new Array[Byte](size)
               buffer.get(array)
-              array
+              val buf = ByteBuffer.wrap(array)
+              new ChunkedByteBuffer(Array(buf))
             } finally {
               channel.close()
             }
         }
 
-        logDebug(s"Get block ${blockId} with $size, hash code: ${data.toSeq.hashCode()}")
-        val buf = ByteBuffer.wrap(data)
-        val chunkedBuffer = new ChunkedByteBuffer(Array(buf))
-        blockManager.putBytes(blockId, chunkedBuffer, storageLevel)
-        logDebug(s"Put block $blockId with size $size successfully (level=$storageLevel)")
-        true
+        val stored = try {
+          blockManager.putBytes(blockId, chunkedBuffer, storageLevel)
+        } catch {
+          case e: Exception =>
+            try chunkedBuffer.dispose() catch { case _: Exception => }
+            throw e
+        }
+
+        if (!stored) {
+          try chunkedBuffer.dispose() catch { case _: Exception => }
+          logWarning(s"Failed to store block $blockId in BlockManager (level=$storageLevel)")
+          false
+        } else {
+          logDebug(s"Put block $blockId with size $size successfully (level=$storageLevel)")
+          true
+        }
 
         // start block transmission immediately
         // val shuffleStatus = getShuffleStatus(blockId)
@@ -338,10 +395,38 @@ class ScacheClient(
     if (size < 0) return IpcFile("")
 
     if (ipcBackend == "pool") {
+      val useSharedCxlPool =
+        cxlSharedEnabled && cxlSharedPoolPath.nonEmpty && !isLocalConsumer(blockId)
+
+      if (useSharedCxlPool) {
+        blockManagerMaster.allocateCxlBlock(size) match {
+          case Some(loc) =>
+            return IpcPoolSlice(loc.poolPath, loc.offset, loc.length)
+          case None =>
+            logWarning(
+              s"Failed to allocate shared CXL pool slice; falling back to local IPC pool " +
+                s"for block $blockId (size=$size)")
+        }
+      }
+
       if (size == 0) return IpcPoolSlice(ipcPoolPath, 0L, 0)
-      val (_, allocator) = getOrCreatePool(ipcPoolPath)
+      val (pool, allocator) = getOrCreatePool(ipcPoolPath)
       allocator.allocate(size) match {
         case Some(offset) =>
+          if (ipcPretouch && size > 0) {
+            try {
+              val buffer = pool.slice(offset, size)
+              val step = Math.max(ipcPretouchPageSize, 1)
+              var i = 0
+              while (i < size) {
+                buffer.put(i, 0.toByte)
+                i += step
+              }
+            } catch {
+              case e: Exception =>
+                logWarning(s"Failed to pretouch IPC pool slice for block $blockId", e)
+            }
+          }
           return IpcPoolSlice(ipcPoolPath, offset, size)
         case None =>
           logWarning(s"IPC pool is full; falling back to file IPC for block $blockId (size=$size)")
@@ -385,16 +470,96 @@ class ScacheClient(
   def sendBlockToDaemon(context: RpcCallContext, blockId: BlockId): Int= {
     val sleepMS = 100
     val retryTimes = conf.getInt("scache.block.fetching.retry", 5)
+    val networkEnabled = conf.getBoolean("scache.storage.network.enabled", true)
     var times = 0
     while (times < retryTimes) {
       logDebug(s"Try to fetch block ${blockId} at ${times} time")
-      blockManager.getLocalBytes(blockId) match {
+      val localBytes = blockManager.getLocalBytes(blockId)
+      val (bufferOpt, fetchedRemotely) = localBytes match {
+        case Some(local) => (Some(local), false)
+        case None =>
+          val cxlLocationOpt =
+            if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty) {
+              try {
+                blockManagerMaster.getCxlBlock(blockId)
+              } catch {
+                case e: Exception =>
+                  logWarning(s"Failed to query shared CXL metadata for $blockId", e)
+                  None
+              }
+            } else {
+              None
+            }
+
+          cxlLocationOpt match {
+            case Some(loc) if loc.length >= 0 && loc.offset >= 0L &&
+                loc.poolPath != null && loc.poolPath.nonEmpty =>
+              try {
+                val f = getIpcFile(blockId.toString)
+                val outCh = FileChannel.open(
+                  f.toPath,
+                  StandardOpenOption.READ,
+                  StandardOpenOption.WRITE,
+                  StandardOpenOption.CREATE,
+                  StandardOpenOption.TRUNCATE_EXISTING)
+                try {
+                  if (loc.length == 0) {
+                    outCh.truncate(0)
+                    return 0
+                  }
+                  val outBuf = outCh.map(MapMode.READ_WRITE, 0, loc.length.toLong)
+                  val inCh = FileChannel.open(new File(loc.poolPath).toPath, StandardOpenOption.READ)
+                  try {
+                    var copied = 0L
+                    while (outBuf.hasRemaining()) {
+                      val n = inCh.read(outBuf, loc.offset + copied)
+                      if (n < 0) {
+                        throw new java.io.IOException(
+                          s"Unexpected EOF while reading shared CXL pool for $blockId " +
+                            s"(path=${loc.poolPath} offset=${loc.offset} length=${loc.length})")
+                      }
+                      copied += n
+                    }
+                  } finally {
+                    inCh.close()
+                  }
+                  return loc.length
+                } finally {
+                  outCh.close()
+                }
+              } catch {
+                case e: Exception =>
+                  logWarning(s"Failed to read $blockId from shared CXL pool; will retry.", e)
+              }
+            case _ =>
+          }
+
+          if (!networkEnabled) {
+            return -1
+          }
+          try {
+            (blockManager.getRemoteBytes(blockId), true)
+          } catch {
+            case e: Exception =>
+              logWarning(s"Failed to fetch remote block $blockId while serving daemon GetBlock", e)
+              (None, true)
+          }
+      }
+
+      bufferOpt match {
         case Some(buffer) =>
-          val chunks = buffer.getChunks()
-          // it should be a single chunked byte buffer
-          assert(chunks.size == 1)
-          val bytes = new Array[Byte](chunks(0).remaining())
-          chunks(0).get(bytes)
+          val bytes = try {
+            val chunks = buffer.getChunks()
+            assert(chunks.size == 1)
+            val arr = new Array[Byte](chunks(0).remaining())
+            chunks(0).get(arr)
+            arr
+          } finally {
+            if (fetchedRemotely) {
+              try buffer.dispose() catch { case _: Exception => }
+            }
+          }
+
           val f = getIpcFile(blockId.toString)
           val channel = FileChannel.open(
             f.toPath,
@@ -413,13 +578,36 @@ class ScacheClient(
           } finally {
             channel.close()
           }
-        case _ =>
+        case None =>
           Thread.sleep(sleepMS)
           times += 1
       }
     }
     return -1
 
+  }
+
+  private def getBlockIpcFromDaemon(context: RpcCallContext, blockId: BlockId): Option[IpcBlock] = {
+    if (blockId == null) return None
+
+    if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty) {
+      try {
+        blockManagerMaster.getCxlBlock(blockId) match {
+          case Some(loc) if loc.poolPath != null && loc.poolPath.nonEmpty &&
+              loc.length >= 0 && loc.offset >= 0L =>
+            return Some(IpcBlock(loc.length, IpcPoolSlice(loc.poolPath, loc.offset, loc.length)))
+          case _ =>
+        }
+      } catch {
+        case e: Exception =>
+          logWarning(s"Failed to query shared CXL metadata for $blockId while serving GetBlockIpc", e)
+      }
+    }
+
+    val size = sendBlockToDaemon(context, blockId)
+    if (size < 0) return None
+    if (size == 0) return Some(IpcBlock(0, IpcFile("")))
+    Some(IpcBlock(size, IpcFile(getIpcFile(blockId.toString).getAbsolutePath)))
   }
 
   private def getShuffleStatus(blockId: BlockId): ShuffleStatus = {

@@ -22,12 +22,13 @@ import java.nio.ByteBuffer
 import java.util.LinkedHashMap
 
 import com.google.common.io.ByteStreams
-import org.scache.io.{ChunkedByteBuffer, ChunkedByteBufferOutputStream}
+import org.scache.io.{ChunkedByteBuffer, ChunkedByteBufferOutputStream, IpcPoolChunkedByteBuffer}
 import org.scache.memory.MemoryMode
 import org.scache.serializer.{SerializationStream, SerializerManager}
 import org.scache.storage.{StorageLevel, BlockId, BlockInfoManager}
+import org.scache.unsafe.Platform
 import org.scache.util.collection.SizeTrackingVector
-import org.scache.util.{CompletionIterator, Logging, ScacheConf, SizeEstimator, Utils}
+import org.scache.util.{CompletionIterator, Logging, NumaUtils, ScacheConf, SizeEstimator, Utils}
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
@@ -309,8 +310,12 @@ private[storage] class MemoryStore(
 
     val allocator = memoryMode match {
       case MemoryMode.ON_HEAP => ByteBuffer.allocate _
-      // Fall back to heap allocation for OFF_HEAP until a dedicated allocator is wired in.
-      case MemoryMode.OFF_HEAP => ByteBuffer.allocate _
+      case MemoryMode.OFF_HEAP =>
+        (size: Int) => {
+          val buffer = Platform.allocateDirectBuffer(size)
+          NumaUtils.bindOffHeapIfEnabled(buffer, conf)
+          buffer
+        }
     }
 
     // Whether there is still enough memory for us to continue unrolling this block
@@ -401,7 +406,10 @@ private[storage] class MemoryStore(
       case null => None
       case e: DeserializedMemoryEntry[_] =>
         throw new IllegalArgumentException("should only call getBytes on serialized blocks")
-      case SerializedMemoryEntry(bytes, _, _) => Some(bytes)
+      case SerializedMemoryEntry(bytes: IpcPoolChunkedByteBuffer, _, _) =>
+        Some(bytes.nonOwningDuplicate())
+      case SerializedMemoryEntry(bytes, _, _) =>
+        Some(bytes)
     }
   }
 

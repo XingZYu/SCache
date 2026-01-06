@@ -79,7 +79,7 @@ private[scache] class BlockInfo(
     // A block's reader count must be non-negative:
     assert(_readerCount >= 0)
     // A block is either locked for reading or for writing, but not for both at the same time:
-    assert(_readerCount == 0 || _writerTask == BlockInfo.HAS_WRITER)
+    assert(_readerCount == 0 || _writerTask != BlockInfo.HAS_WRITER)
   }
 
   checkInvariants()
@@ -88,7 +88,7 @@ private[scache] class BlockInfo(
 private[scache] object BlockInfo {
 
   /**
-   * Special task attempt id constant used to mark a block's write lock as being unlocked.
+   * Special task attempt id constant used to mark a block's write lock as being held by a writer.
    */
   val HAS_WRITER: Long = 0
 
@@ -181,15 +181,31 @@ private[scache] class BlockInfoManager extends Logging {
     */
   def lockForReading(blockId: BlockId, blocking: Boolean = true): Option[BlockInfo] = {
     logTrace(s"Trying to acquire read lock for $blockId")
-    infos.get(blockId) match {
-      case None => return None
-      case Some(info) =>
-        if (info.writerTask == BlockInfo.NON_TASK_WRITER) {
-          readLocksByBlockId(blockId).incrementAndGet()
-          return Some(info)
+    synchronized {
+      while (true) {
+        infos.get(blockId) match {
+          case None =>
+            return None
+          case Some(info) =>
+            if (info.writerTask != BlockInfo.HAS_WRITER) {
+              val counter = readLocksByBlockId.getOrElseUpdate(blockId, new AtomicInteger(0))
+              counter.incrementAndGet()
+              return Some(info)
+            } else if (!blocking) {
+              return None
+            } else {
+              try {
+                wait()
+              } catch {
+                case _: InterruptedException =>
+                  Thread.currentThread().interrupt()
+                  return None
+              }
+            }
         }
+      }
+      None
     }
-    None
   }
 
   /**
@@ -208,18 +224,32 @@ private[scache] class BlockInfoManager extends Logging {
       blockId: BlockId,
       blocking: Boolean = true): Option[BlockInfo] = {
     logTrace(s"Task $currentTaskAttemptId trying to acquire write lock for $blockId")
-    infos.get(blockId) match {
-      case None => return None
-      case Some(info) =>
-        if (readLocksByBlockId(blockId).get() == 0) synchronized {
-          if (info.writerTask == BlockInfo.NON_TASK_WRITER) {
-            info.writerTask = BlockInfo.HAS_WRITER
-            logTrace(s"Acquired write lock for $blockId")
-            return Some(info)
-          }
+    synchronized {
+      while (true) {
+        infos.get(blockId) match {
+          case None =>
+            return None
+          case Some(info) =>
+            val counter = readLocksByBlockId.getOrElseUpdate(blockId, new AtomicInteger(0))
+            if (info.writerTask != BlockInfo.HAS_WRITER && counter.get() == 0) {
+              info.writerTask = BlockInfo.HAS_WRITER
+              logTrace(s"Acquired write lock for $blockId")
+              return Some(info)
+            } else if (!blocking) {
+              return None
+            } else {
+              try {
+                wait()
+              } catch {
+                case _: InterruptedException =>
+                  Thread.currentThread().interrupt()
+                  return None
+              }
+            }
         }
+      }
+      None
     }
-    None
   }
 
   /**
@@ -268,17 +298,20 @@ private[scache] class BlockInfoManager extends Logging {
    */
   def unlockRead(blockId: BlockId): Boolean = {
     logTrace(s"releasing lock for $blockId")
-    get(blockId).getOrElse {
-      throw new IllegalStateException(s"Block $blockId not found")
+    synchronized {
+      get(blockId).getOrElse {
+        throw new IllegalStateException(s"Block $blockId not found")
+      }
+      readLocksByBlockId.get(blockId) match {
+        case Some(count) =>
+          assert(count.get() > 0, s"Block $blockId is not locked for reading")
+          count.decrementAndGet()
+        case None =>
+          throw new IllegalStateException(s"Block $blockId not found in lock table")
+      }
+      notifyAll()
+      true
     }
-    readLocksByBlockId.get(blockId) match {
-      case Some(count) =>
-        assert(count.get() > 0, s"Block $blockId is not locked for reading")
-        count.decrementAndGet()
-      case None =>
-        throw new IllegalStateException(s"Block $blockId not found in lock table")
-    }
-    true
   }
 
   def unlockWrite(blockId: BlockId): Boolean = {
@@ -289,6 +322,7 @@ private[scache] class BlockInfoManager extends Logging {
     synchronized {
       if (info.writerTask == BlockInfo.HAS_WRITER) {
         info.writerTask = BlockInfo.NON_TASK_WRITER
+        notifyAll()
         true
       } else {
         false
@@ -310,13 +344,22 @@ private[scache] class BlockInfoManager extends Logging {
       blockId: BlockId,
       newBlockInfo: BlockInfo): Boolean = {
     logTrace(s"Task $currentTaskAttemptId trying to put $blockId")
-    newBlockInfo.writerTask = BlockInfo.HAS_WRITER
-    infos.putIfAbsent(blockId, newBlockInfo) match {
-      case Some(info) =>
-        false
-      case None =>
-        readLocksByBlockId.putIfAbsent(blockId, new AtomicInteger)
-        true
+    synchronized {
+      newBlockInfo.writerTask = BlockInfo.HAS_WRITER
+      while (true) {
+        infos.putIfAbsent(blockId, newBlockInfo) match {
+          case Some(_) =>
+            // Block already exists: wait for any ongoing write to finish and acquire a read lock.
+            lockForReading(blockId, blocking = true) match {
+              case Some(_) => return false
+              case None => // The block was removed; retry.
+            }
+          case None =>
+            readLocksByBlockId.putIfAbsent(blockId, new AtomicInteger(0))
+            return true
+        }
+      }
+      false
     }
   }
 
@@ -411,6 +454,7 @@ private[scache] class BlockInfoManager extends Logging {
         throw new IllegalArgumentException(
           s"called remove() on non-existent lock of block $blockId")
     }
+    notifyAll()
   }
 
   /**

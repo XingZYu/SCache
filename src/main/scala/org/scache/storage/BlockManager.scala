@@ -105,6 +105,41 @@ private[scache] class BlockManager(
   // to revisit whether reporting this value as the "max" is intuitive to the user.
   private val maxMemory = memoryManager.maxOnHeapStorageMemory
 
+  // Tiered storage (DRAM -> off-heap/CXL -> disk) configuration.
+  private val tieredStorageEnabled = conf.getBoolean("scache.storage.tiered.enabled", false)
+  private val tieredSpillToOffHeap =
+    conf.getBoolean("scache.storage.tiered.offHeap.enabled", tieredStorageEnabled)
+  private val tieredSpillToDisk =
+    conf.getBoolean("scache.storage.tiered.disk.enabled", tieredStorageEnabled)
+  private val hasOffHeapTier =
+    conf.getSizeAsBytes("scache.memory.offHeap.size", "0b") > 0
+  private val networkDataTransferEnabled =
+    conf.getBoolean("scache.storage.network.enabled", true)
+
+  private def shouldCopyToHeap(bytes: ChunkedByteBuffer): Boolean = {
+    val chunks = bytes.chunks
+    chunks != null && chunks.exists { b =>
+      b != null && (b.isDirect || b.isInstanceOf[java.nio.MappedByteBuffer])
+    }
+  }
+
+  private def copyForMemoryMode(bytes: ChunkedByteBuffer, memoryMode: MemoryMode): ChunkedByteBuffer = {
+    memoryMode match {
+      case MemoryMode.ON_HEAP =>
+        if (tieredStorageEnabled && shouldCopyToHeap(bytes)) {
+          bytes.copy(ByteBuffer.allocate)
+        } else {
+          bytes
+        }
+      case MemoryMode.OFF_HEAP =>
+        bytes.copy { size =>
+          val buffer = Platform.allocateDirectBuffer(size)
+          NumaUtils.bindOffHeapIfEnabled(buffer, conf)
+          buffer
+        }
+    }
+  }
+
   // Port used by the external shuffle service. In Yarn mode, this may be already be
   // set through the Hadoop configuration as the server is launched in the Yarn NM.
   // private val externalShuffleServicePort = {
@@ -560,6 +595,10 @@ private[scache] class BlockManager(
    * Get block from remote block managers as serialized bytes.
    */
   def getRemoteBytes(blockId: BlockId): Option[ChunkedByteBuffer] = {
+    if (!networkDataTransferEnabled) {
+      throw new UnsupportedOperationException(
+        s"Remote block fetch is disabled (scache.storage.network.enabled=false): $blockId")
+    }
     logDebug(s"Getting remote block $blockId")
     require(blockId != null, "BlockId is null")
     var runningFailureCount = 0
@@ -614,6 +653,10 @@ private[scache] class BlockManager(
   }
 
   def asyncGetRemoteBlock(bmId: BlockManagerId, blockIds: Array[String]): Unit = {
+    if (!networkDataTransferEnabled) {
+      throw new UnsupportedOperationException(
+        s"Remote block fetch is disabled (scache.storage.network.enabled=false): $bmId")
+    }
     if (blockIds.length == 0) {
       logWarning(s"Got an empty block fetch request")
       return
@@ -869,7 +912,9 @@ private[scache] class BlockManager(
       if (level.useMemory) {
         // Put it in memory first, even if it also has useDisk set to true;
         // We will drop it to disk later if the memory store can't hold it.
-        val putSucceeded = if (level.deserialized) {
+        val initialMemoryMode = level.memoryMode
+
+        val putSucceeded: Boolean = if (level.deserialized) {
           val values =
             serializerManager.dataDeserializeStream(blockId, bytes.toInputStream())(classTag)
           memoryStore.putIteratorAsValues(blockId, values, classTag) match {
@@ -881,14 +926,52 @@ private[scache] class BlockManager(
               false
           }
         } else {
-          memoryStore.putBytes(blockId, size, level.memoryMode, () => bytes)
+          memoryStore.putBytes(blockId, size, initialMemoryMode, () => copyForMemoryMode(bytes, initialMemoryMode))
         }
-        if (!putSucceeded && level.useDisk) {
+
+        val allowDiskFallback = level.useDisk || (tieredStorageEnabled && tieredSpillToDisk)
+
+        val finalPutSucceeded =
+          if (putSucceeded) {
+            val useOffHeap = initialMemoryMode == MemoryMode.OFF_HEAP
+            val deserialized = if (useOffHeap) false else level.deserialized
+            info.level = StorageLevel(
+              useDisk = allowDiskFallback,
+              useMemory = true,
+              useOffHeap = useOffHeap,
+              deserialized = deserialized,
+              replication = level.replication)
+            true
+          } else if (tieredStorageEnabled && tieredSpillToOffHeap && hasOffHeapTier &&
+              initialMemoryMode == MemoryMode.ON_HEAP && !level.deserialized) {
+            val offHeapPut = memoryStore.putBytes(
+              blockId,
+              size,
+              MemoryMode.OFF_HEAP,
+              () => copyForMemoryMode(bytes, MemoryMode.OFF_HEAP))
+            if (offHeapPut) {
+              info.level = StorageLevel(
+                useDisk = allowDiskFallback,
+                useMemory = true,
+                useOffHeap = true,
+                deserialized = false,
+                replication = level.replication)
+              true
+            } else {
+              false
+            }
+          } else {
+            false
+          }
+
+        if (!finalPutSucceeded && allowDiskFallback) {
           logWarning(s"Persisting block $blockId to disk instead.")
           diskStore.putBytes(blockId, bytes)
+          info.level = StorageLevel.DISK_ONLY
         }
-      } else if (level.useDisk) {
+      } else if (level.useDisk || (tieredStorageEnabled && tieredSpillToDisk)) {
         diskStore.putBytes(blockId, bytes)
+        info.level = StorageLevel.DISK_ONLY
       }
 
       val putBlockStatus = getCurrentBlockStatus(blockId, info)
@@ -1099,7 +1182,12 @@ private[scache] class BlockManager(
         } else {
           val allocator = level.memoryMode match {
             case MemoryMode.ON_HEAP => ByteBuffer.allocate _
-            case MemoryMode.OFF_HEAP => Platform.allocateDirectBuffer _
+            case MemoryMode.OFF_HEAP =>
+              (size: Int) => {
+                val buffer = Platform.allocateDirectBuffer(size)
+                NumaUtils.bindOffHeapIfEnabled(buffer, conf)
+                buffer
+              }
           }
           val putSucceeded = memoryStore.putBytes(blockId, diskBytes.size, level.memoryMode, () => {
             // https://issues.apache.org/jira/browse/SPARK-6076
@@ -1183,6 +1271,11 @@ private[scache] class BlockManager(
       data: ChunkedByteBuffer,
       level: StorageLevel,
       classTag: ClassTag[_]): Unit = {
+    if (!networkDataTransferEnabled) {
+      logWarning(
+        s"Skipping replication for $blockId because scache.storage.network.enabled=false")
+      return
+    }
     val maxReplicationFailures = conf.getInt("scache.storage.maxReplicationFailures", 1)
     val numPeersToReplicateTo = level.replication - 1
     val peersForReplication = new ArrayBuffer[BlockManagerId]
@@ -1322,10 +1415,61 @@ private[scache] class BlockManager(
       data: () => Either[Array[T], ChunkedByteBuffer]): StorageLevel = {
     logInfo(s"Dropping block $blockId from memory")
     val info = blockInfoManager.assertExistence(blockId)
-    var blockIsUpdated = false
     val level = info.level
+    val droppedMemorySize =
+      if (memoryStore.contains(blockId)) memoryStore.getSize(blockId) else 0L
 
-    // Drop to disk, if storage level requires
+    val canDemoteToOffHeap =
+      tieredStorageEnabled && tieredSpillToOffHeap && hasOffHeapTier &&
+        level.useMemory && !level.useOffHeap
+
+    if (canDemoteToOffHeap) {
+      data() match {
+        case Right(bytes0) =>
+          val unsafeToReuseAfterRemove =
+            bytes0.isInstanceOf[org.scache.io.IpcPoolChunkedByteBuffer] ||
+              bytes0.chunks.exists(_.isInstanceOf[java.nio.MappedByteBuffer])
+          val safeBytes =
+            if (unsafeToReuseAfterRemove) bytes0.copy(ByteBuffer.allocate) else bytes0
+
+          val removed = memoryStore.remove(blockId)
+          if (!removed) {
+            logWarning(s"Block $blockId could not be dropped from memory as it does not exist")
+          }
+
+          val offHeapPut = memoryStore.putBytes(
+            blockId,
+            safeBytes.size,
+            MemoryMode.OFF_HEAP,
+            () => copyForMemoryMode(safeBytes, MemoryMode.OFF_HEAP))
+
+          if (offHeapPut) {
+            info.level = StorageLevel(
+              useDisk = tieredSpillToDisk || level.useDisk,
+              useMemory = true,
+              useOffHeap = true,
+              deserialized = false,
+              replication = level.replication)
+          } else {
+            if (!diskStore.contains(blockId)) {
+              logInfo(s"Writing block $blockId to disk")
+              diskStore.putBytes(blockId, safeBytes)
+            }
+            info.level = StorageLevel.DISK_ONLY
+          }
+
+          val status = getCurrentBlockStatus(blockId, info)
+          if (info.tellMaster) {
+            reportBlockStatus(blockId, info, status, droppedMemorySize)
+          }
+          return status.storageLevel
+
+        case Left(_) =>
+          // Fall through to disk spill.
+      }
+    }
+
+    // Drop to disk (tier 3).
     if (!diskStore.contains(blockId)) {
       logInfo(s"Writing block $blockId to disk")
       data() match {
@@ -1339,18 +1483,11 @@ private[scache] class BlockManager(
         case Right(bytes) =>
           diskStore.putBytes(blockId, bytes)
       }
-      blockIsUpdated = true
     }
-    // update storage level
     info.level = StorageLevel.DISK_ONLY
 
-    // Actually drop from memory store
-    val droppedMemorySize =
-      if (memoryStore.contains(blockId)) memoryStore.getSize(blockId) else 0L
     val blockIsRemoved = memoryStore.remove(blockId)
-    if (blockIsRemoved) {
-      blockIsUpdated = true
-    } else {
+    if (!blockIsRemoved) {
       logWarning(s"Block $blockId could not be dropped from memory as it does not exist")
     }
 

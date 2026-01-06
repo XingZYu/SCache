@@ -116,4 +116,23 @@ private[scache] object BlockManagerMessages {
 
   case class HasCachedBlocks(executorId: String) extends ToBlockManagerMaster
 
+  //////////////////////////////////////////////////////////////////////////////////
+  // Shared CXL (fsdax) pool metadata (master-managed).
+  //////////////////////////////////////////////////////////////////////////////////
+
+  /** A location inside a shared, file-backed (fsdax) pool: (path, offset, length). */
+  case class CxlBlockLocation(poolPath: String, offset: Long, length: Int) extends Serializable
+
+  /** Allocate a slice in the shared CXL pool for a block payload of `length` bytes. */
+  case class AllocateCxlBlock(length: Int) extends ToBlockManagerMaster
+
+  /** Register a committed block as residing in the shared CXL pool. */
+  case class RegisterCxlBlock(blockId: BlockId, location: CxlBlockLocation) extends ToBlockManagerMaster
+
+  /** Lookup a block's shared CXL pool location, if any. */
+  case class GetCxlBlock(blockId: BlockId) extends ToBlockManagerMaster
+
+  /** Remove a block's shared CXL pool metadata and free the slice (best effort). */
+  case class ReleaseCxlBlock(blockId: BlockId) extends ToBlockManagerMaster
+
 }

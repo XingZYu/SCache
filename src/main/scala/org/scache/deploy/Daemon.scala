@@ -40,6 +40,8 @@ class Daemon(
   private val rpcEnv = RpcEnv.create("scache.daemon", host, daemonPort, conf, true)
   private val clientRef = rpcEnv.setupEndpointRef(RpcAddress(host, clientPort), "ScacheClient")
 
+  private val putBlockAsync = conf.getBoolean("scache.daemon.putBlock.async", true)
+
   private val ipcBackend = conf.getString("scache.daemon.ipc.backend", "files").trim.toLowerCase
   private val ipcMode = conf.getString("scache.daemon.ipc.mode", "remote").trim.toLowerCase
   private val ipcDirRemote = conf.getString(
@@ -93,13 +95,43 @@ class Daemon(
     }
   }
 
+  /**
+   * Allocate an IPC pool slice for the given block. Spark can write shuffle bytes directly
+   * into the returned (poolPath, offset, length) region and then call `commitPutBlockPool`
+   * to publish the block to the SCache client.
+   */
+  def preparePutBlockPool(blockId: String, size: Int): IpcPoolSlice = {
+    val scacheBlockId = BlockId.apply(blockId)
+    val ipc = clientRef.askWithRetry[IpcLocation](PreparePutBlock(scacheBlockId, size))
+    ipc match {
+      case slice: IpcPoolSlice => slice
+      case other =>
+        throw new IllegalStateException(
+          s"Expected IpcPoolSlice for block $blockId (size=$size), but got $other")
+    }
+  }
+
+  /**
+   * Publish a previously-prepared IPC pool slice as the final contents of the given block.
+   * The SCache client will read the bytes from the IPC region and store them.
+   */
+  def commitPutBlockPool(blockId: String, size: Int, poolPath: String, offset: Long): Boolean = {
+    val scacheBlockId = BlockId.apply(blockId)
+    val resolvedPoolPath = if (poolPath != null && poolPath.nonEmpty) poolPath else ipcPoolPath
+    clientRef.askWithRetry[Boolean](PutBlock(
+      scacheBlockId,
+      size,
+      IpcPoolSlice(resolvedPoolPath, offset, size)))
+  }
+
   def putBlock(blockId: String, data: Array[Byte], rawLen: Int, compressedLen: Int): Unit = {
     val scacheBlockId = BlockId.apply(blockId)
     if (!scacheBlockId.isInstanceOf[ScacheBlockId]) {
       logError(s"Unexpected block type, except ScacheBlockId, got ${scacheBlockId.getClass.getSimpleName}")
     }
     logDebug(s"Start copying block $blockId with size $rawLen")
-    doAsync[Unit](s"Copy block $blockId") {
+
+    def doPut(): Unit = {
       val preparedIpc: Option[IpcLocation] = if (ipcPrepare) {
         try {
           Some(clientRef.askWithRetry[IpcLocation](PreparePutBlock(scacheBlockId, data.length)))
@@ -150,6 +182,14 @@ class Daemon(
         logDebug(s"Copy block $blockId failed")
       }
     }
+
+    if (putBlockAsync) {
+      doAsync[Unit](s"Copy block $blockId") {
+        doPut()
+      }
+    } else {
+      doPut()
+    }
   }
   def getBlock(blockId: String): Option[Array[Byte]] = {
     val scacheBlockId = BlockId.apply(blockId)
@@ -180,6 +220,21 @@ class Daemon(
         logWarning(s"Failed to read block $blockId from IPC file", e)
         None
     }
+  }
+
+  /**
+   * Return an IPC location for the given block without materializing a large byte[].
+   *
+   * This may return either:
+   *   - IpcFile(path): per-block IPC file prepared by the SCache client, or
+   *   - IpcPoolSlice(poolPath, offset, length): a slice in a shared pool file (e.g., fsdax/CXL).
+   */
+  def getBlockIpc(blockId: String): Option[IpcBlock] = {
+    val scacheBlockId = BlockId.apply(blockId)
+    if (!scacheBlockId.isInstanceOf[ScacheBlockId]) {
+      return None
+    }
+    clientRef.askWithRetry[Option[IpcBlock]](GetBlockIpc(scacheBlockId))
   }
   def registerShuffles(jobId: Int, shuffleIds: Array[Int], maps: Array[Int], reduces: Array[Int]): Unit = {
     doAsync[Unit] ("Register Shuffles") {

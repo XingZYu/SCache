@@ -17,7 +17,11 @@
 
 package org.scache.storage
 
-import java.util.{HashMap => JHashMap}
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.StandardOpenOption
+import java.util.{HashMap => JHashMap, TreeMap => JTreeMap}
 
 import org.scache.MapOutputTrackerMaster
 
@@ -48,6 +52,38 @@ class BlockManagerMasterEndpoint(
 
   // Mapping from block id to the set of block managers that have the block.
   private val blockLocations = new JHashMap[BlockId, mutable.HashSet[BlockManagerId]]
+
+  // Shared CXL (fsdax) pool metadata: block -> (poolPath, offset, length).
+  private val cxlSharedEnabled =
+    conf.getBoolean("scache.storage.cxl.shared.enabled", false)
+  private val cxlSharedPoolPath =
+    conf.getString("scache.storage.cxl.shared.pool.path", "").trim
+  private val cxlSharedPoolSizeBytes =
+    conf.getSizeAsBytes("scache.storage.cxl.shared.pool.size", "0b")
+  private val cxlSharedPoolAlignBytes =
+    conf.getInt("scache.storage.cxl.shared.pool.align", 4096)
+
+  private val cxlStateLock = new Object
+  private val cxlBlocks = new mutable.HashMap[BlockId, CxlBlockLocation]()
+  private val cxlAllocator: Option[CxlPoolAllocator] = {
+    if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty && cxlSharedPoolSizeBytes > 0) {
+      val ensuredSize = ensurePoolFileSize(cxlSharedPoolPath, cxlSharedPoolSizeBytes)
+      if (ensuredSize <= 0) {
+        logWarning(
+          s"Shared CXL pool is enabled but has invalid size=$ensuredSize; disabling shared pool.")
+        None
+      } else {
+        Some(new CxlPoolAllocator(ensuredSize, cxlSharedPoolAlignBytes))
+      }
+    } else {
+      if (cxlSharedEnabled) {
+        logWarning(
+          "Shared CXL pool is enabled but scache.storage.cxl.shared.pool.path/size are not set; " +
+            "disabling shared pool.")
+      }
+      None
+    }
+  }
 
   private val askThreadPool = ThreadUtils.newDaemonCachedThreadPool("block-manager-ask-thread-pool")
   private implicit val askExecutionContext: ExecutionContextExecutorService =
@@ -90,6 +126,18 @@ class BlockManagerMasterEndpoint(
     case GetMatchingBlockIds(filter, askSlaves) =>
       context.reply(getMatchingBlockIds(filter, askSlaves))
 
+    case AllocateCxlBlock(length) =>
+      context.reply(allocateCxlBlock(length))
+
+    case RegisterCxlBlock(blockId, location) =>
+      context.reply(registerCxlBlock(blockId, location))
+
+    case GetCxlBlock(blockId) =>
+      context.reply(getCxlBlock(blockId))
+
+    case ReleaseCxlBlock(blockId) =>
+      context.reply(releaseCxlBlock(blockId))
+
     case RemoveRdd(rddId) =>
       context.reply(removeRdd(rddId))
 
@@ -100,6 +148,7 @@ class BlockManagerMasterEndpoint(
       context.reply(removeBroadcast(broadcastId, removeFromDriver))
 
     case RemoveBlock(blockId) =>
+      releaseCxlBlock(blockId)
       removeBlockFromWorkers(blockId)
       context.reply(true)
 
@@ -127,6 +176,86 @@ class BlockManagerMasterEndpoint(
       }
   }
 
+  private def allocateCxlBlock(length: Int): Option[CxlBlockLocation] = {
+    if (length < 0) return None
+    cxlAllocator match {
+      case Some(allocator) =>
+        allocator.allocate(length).map { offset =>
+          CxlBlockLocation(cxlSharedPoolPath, offset, length)
+        }
+      case None =>
+        None
+    }
+  }
+
+  private def registerCxlBlock(blockId: BlockId, location: CxlBlockLocation): Boolean = {
+    if (blockId == null || location == null) return false
+    if (location.length < 0 || location.offset < 0L) return false
+    if (!cxlSharedEnabled) return false
+    if (cxlSharedPoolPath.isEmpty) return false
+    if (location.poolPath != cxlSharedPoolPath) return false
+    cxlStateLock.synchronized {
+      cxlBlocks.put(blockId, location)
+    }
+    true
+  }
+
+  private def getCxlBlock(blockId: BlockId): Option[CxlBlockLocation] = {
+    if (blockId == null) return None
+    cxlStateLock.synchronized {
+      cxlBlocks.get(blockId)
+    }
+  }
+
+  private def releaseCxlBlock(blockId: BlockId): Boolean = {
+    if (blockId == null) return false
+    val removed = cxlStateLock.synchronized {
+      cxlBlocks.remove(blockId)
+    }
+    (removed, cxlAllocator) match {
+      case (Some(loc), Some(allocator)) =>
+        allocator.free(loc.offset, loc.length)
+        true
+      case (Some(_), None) =>
+        true
+      case (None, _) =>
+        false
+    }
+  }
+
+  private def ensurePoolFileSize(path: String, desiredSizeBytes: Long): Long = {
+    if (path == null || path.trim.isEmpty) return 0L
+    if (desiredSizeBytes <= 0) return 0L
+
+    val f = new File(path)
+    val parent = f.getParentFile
+    if (parent != null && !parent.exists() && !parent.mkdirs()) {
+      logWarning(s"Failed to create shared CXL pool directory: ${parent.getAbsolutePath}")
+      return 0L
+    }
+
+    val channel = FileChannel.open(
+      f.toPath,
+      StandardOpenOption.READ,
+      StandardOpenOption.WRITE,
+      StandardOpenOption.CREATE)
+    try {
+      val currentSize = channel.size()
+      val targetSize = Math.max(currentSize, desiredSizeBytes)
+      if (currentSize < targetSize) {
+        channel.position(targetSize - 1)
+        channel.write(ByteBuffer.wrap(Array[Byte](0)))
+      }
+      channel.size()
+    } catch {
+      case e: Exception =>
+        logWarning(s"Failed to create/resize shared CXL pool file: $path", e)
+        0L
+    } finally {
+      channel.close()
+    }
+  }
+
   private def removeRdd(rddId: Int): Future[Seq[Int]] = {
     // First remove the metadata for the given RDD, and then asynchronously remove the blocks
     // from the slaves.
@@ -151,13 +280,27 @@ class BlockManagerMasterEndpoint(
   }
 
   private def removeShuffle(shuffleId: Int): Future[Seq[Boolean]] = {
-    // Nothing to do in the BlockManagerMasterEndpoint data structures
+    releaseCxlBlocksForShuffle(shuffleId)
     val removeMsg = RemoveShuffle(shuffleId)
     Future.sequence(
       blockManagerInfo.values.map { bm =>
         bm.slaveEndpoint.ask[Boolean](removeMsg)
       }.toSeq
     )
+  }
+
+  private def releaseCxlBlocksForShuffle(shuffleId: Int): Unit = {
+    if (!cxlSharedEnabled) return
+    val removedLocations = cxlStateLock.synchronized {
+      val matches = cxlBlocks.collect {
+        case (bid: ScacheBlockId, loc) if bid.shuffleId == shuffleId => (bid, loc)
+      }.toArray
+      matches.foreach { case (bid, _) => cxlBlocks.remove(bid) }
+      matches.map(_._2).toSeq
+    }
+    cxlAllocator.foreach { allocator =>
+      removedLocations.foreach(loc => allocator.free(loc.offset, loc.length))
+    }
   }
 
   /**
@@ -416,6 +559,116 @@ class BlockManagerMasterEndpoint(
 
   override def onStop(): Unit = {
     askThreadPool.shutdownNow()
+  }
+}
+
+/**
+ * Simple master-managed allocator for a single shared file-backed pool.
+ *
+ * This is intentionally lightweight: it allocates contiguous (offset, length) ranges with
+ * alignment and supports best-effort free with coalescing.
+ */
+private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
+  require(poolSizeBytes > 0, s"poolSizeBytes must be > 0, got $poolSizeBytes")
+  require(alignBytes > 0, s"alignBytes must be > 0, got $alignBytes")
+
+  private val free = new JTreeMap[java.lang.Long, java.lang.Long]()
+  private var nextOffset = 0L
+
+  private def alignUp(value: Long): Long = {
+    val a = alignBytes.toLong
+    if (a <= 1) return value
+    ((value + a - 1) / a) * a
+  }
+
+  def allocate(size: Int): Option[Long] = synchronized {
+    if (size < 0) return None
+    if (size == 0) return Some(0L)
+    if (size.toLong > poolSizeBytes) return None
+
+    allocateFromFree(size) match {
+      case some @ Some(_) => return some
+      case None =>
+    }
+
+    val originalNext = nextOffset
+    var off = nextOffset
+
+    val aligned = alignUp(off)
+    if (aligned > off) insertFree(off, aligned - off)
+    off = aligned
+
+    if (off + size <= poolSizeBytes) {
+      nextOffset = off + size
+      return Some(off)
+    }
+
+    // Wrap-around: add remaining tail as free and retry from free list.
+    if (originalNext < poolSizeBytes) {
+      insertFree(originalNext, poolSizeBytes - originalNext)
+    }
+    nextOffset = 0L
+    allocateFromFree(size)
+  }
+
+  private def allocateFromFree(size: Int): Option[Long] = {
+    var entry = free.firstEntry()
+    while (entry != null) {
+      val segOffset = entry.getKey.longValue()
+      val segLen = entry.getValue.longValue()
+      val segEnd = segOffset + segLen
+
+      val candidate = alignUp(segOffset)
+      if (candidate >= segOffset && candidate + size <= segEnd) {
+        free.remove(entry.getKey)
+
+        if (candidate > segOffset) {
+          free.put(segOffset, candidate - segOffset)
+        }
+        val allocatedEnd = candidate + size
+        if (allocatedEnd < segEnd) {
+          free.put(allocatedEnd, segEnd - allocatedEnd)
+        }
+        return Some(candidate)
+      }
+
+      entry = free.higherEntry(entry.getKey)
+    }
+    None
+  }
+
+  def free(offset: Long, size: Int): Unit = synchronized {
+    insertFree(offset, size.toLong)
+  }
+
+  private def insertFree(offset: Long, length: Long): Unit = {
+    if (length <= 0) return
+    if (offset < 0 || offset + length > poolSizeBytes) return
+
+    var start = offset
+    var end = offset + length
+
+    val prev = free.floorEntry(start)
+    if (prev != null) {
+      val prevStart = prev.getKey.longValue()
+      val prevEnd = prevStart + prev.getValue.longValue()
+      if (prevEnd >= start) {
+        start = prevStart
+        end = Math.max(end, prevEnd)
+        free.remove(prev.getKey)
+      }
+    }
+
+    var next = free.ceilingEntry(start)
+    while (next != null && next.getKey.longValue() <= end) {
+      val nextStart = next.getKey.longValue()
+      val nextEnd = nextStart + next.getValue.longValue()
+      end = Math.max(end, nextEnd)
+      free.remove(next.getKey)
+      next = free.ceilingEntry(start)
+    }
+
+    free.put(start, end - start)
   }
 }
 

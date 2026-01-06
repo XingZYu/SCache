@@ -237,11 +237,11 @@ private[scache] object StorageUtils extends Logging {
    * unfortunately no standard API to do this.
    */
   def dispose(buffer: ByteBuffer): Unit = {
-    if (buffer != null && buffer.isInstanceOf[MappedByteBuffer]) {
-      logTrace(s"Unmapping $buffer")
-      if (buffer.asInstanceOf[DirectBuffer].cleaner() != null) {
-        buffer.asInstanceOf[DirectBuffer].cleaner().clean()
-      }
+    if (buffer == null || !buffer.isDirect) return
+    val cleaner = buffer.asInstanceOf[DirectBuffer].cleaner()
+    if (cleaner != null) {
+      logTrace(s"Unmapping/cleaning $buffer")
+      cleaner.clean()
     }
   }
 
