@@ -673,6 +673,28 @@ object ScacheClient extends Logging{
   def main(args: Array[String]): Unit = {
     val conf = new ScacheConf()
     val arguements = new ClientArguments(args, conf)
+
+    val ipcBackend = conf.getString("scache.daemon.ipc.backend", "files").trim.toLowerCase
+    if (ipcBackend == "pool") {
+      val isLoopback = try {
+        java.net.InetAddress.getByName(arguements.host).isLoopbackAddress
+      } catch {
+        case _: Exception => false
+      }
+      if (isLoopback) {
+        val configuredPoolPath = conf.getString(
+          "scache.daemon.ipc.pool.path",
+          new File(ScacheConf.scacheLocalDir, "scache-ipc.pool").getAbsolutePath)
+        val suffix = arguements.host.replace(':', '_').replace('.', '_')
+        val desiredPoolPath =
+          if (configuredPoolPath.endsWith("." + suffix)) configuredPoolPath
+          else configuredPoolPath + "." + suffix
+        if (desiredPoolPath != configuredPoolPath) {
+          conf.set("scache.daemon.ipc.pool.path", desiredPoolPath)
+        }
+      }
+    }
+
     val hostName = Utils.findLocalInetAddress().getHostName
     System.setProperty("SCACHE_DAEMON", s"client-${hostName}")
     conf.set("scache.rpc.askTimeout", "10")
