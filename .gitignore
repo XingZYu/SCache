@@ -8,3 +8,5 @@ logs/
 tmp/
 .vscode/
 native/*.so
+conf/*.orig
+scache-multinode.zip
