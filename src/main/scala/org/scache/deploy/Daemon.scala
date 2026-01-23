@@ -237,13 +237,14 @@ class Daemon(
     clientRef.askWithRetry[Option[IpcBlock]](GetBlockIpc(scacheBlockId))
   }
   def registerShuffles(jobId: Int, shuffleIds: Array[Int], maps: Array[Int], reduces: Array[Int]): Unit = {
-    doAsync[Unit] ("Register Shuffles") {
-      val res = clientRef.askWithRetry[Boolean](RegisterShuffle(platform, jobId, shuffleIds, maps, reduces))
-      if (res) {
-        logInfo(s"Register shuffles ${shuffleIds} succeeded")
-      } else {
-        logInfo(s"Register shuffles ${shuffleIds} failed")
-      }
+    // Registration must be synchronous to ensure the shuffle is registered before returning.
+    // Using doAsync here causes a race condition where tasks may try to read shuffle data
+    // before the shuffle is registered, leading to "Shuffle is unregistered" errors.
+    val res = clientRef.askWithRetry[Boolean](RegisterShuffle(platform, jobId, shuffleIds, maps, reduces))
+    if (res) {
+      logInfo(s"Register shuffles ${shuffleIds.mkString(",")} succeeded")
+    } else {
+      logWarning(s"Register shuffles ${shuffleIds.mkString(",")} failed")
     }
   }
   def mapEnd(jobId: Int, shuffleId: Int, mapId: Int): Unit = {
