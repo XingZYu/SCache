@@ -247,6 +247,12 @@ class ScacheClient(
       doAsync[Option[IpcBlock]](s"Fetch IPC location for block ${blockId} from daemon", context) {
         getBlockIpcFromDaemon(context, blockId)
       }
+    case GetBlocksIpc(blockIds) =>
+      doAsync[Seq[Option[IpcBlock]]](s"Fetch IPC locations for ${blockIds.size} blocks from daemon", context) {
+        blockIds.map { blockId =>
+          getBlockIpcFromDaemon(context, blockId)
+        }
+      }
     case _ =>
       logError("Empty message received !")
   }
@@ -327,12 +333,14 @@ class ScacheClient(
         val chunkedBuffer: ChunkedByteBuffer = ipc match {
           case IpcPoolSlice(poolPath, offset, _) if ipcPoolZeroCopyPut &&
             storageLevel.useMemory && !storageLevel.useDisk && !storageLevel.deserialized =>
+            val resolvedPoolPath = if (poolPath.nonEmpty) poolPath else ipcPoolPath
             val (pool, allocator) =
-              getOrCreatePool(if (poolPath.nonEmpty) poolPath else ipcPoolPath)
+              getOrCreatePool(resolvedPoolPath)
             val buffer = pool.slice(offset, size)
             new IpcPoolChunkedByteBuffer(
               Array(buffer),
-              () => allocator.free(offset, size))
+              () => allocator.free(offset, size),
+              resolvedPoolPath, offset, size)
 
           case IpcPoolSlice(poolPath, offset, _) =>
             val (pool, allocator) =
@@ -602,6 +610,16 @@ class ScacheClient(
         case e: Exception =>
           logWarning(s"Failed to query shared CXL metadata for $blockId while serving GetBlockIpc", e)
       }
+    }
+
+    // If the block is stored locally as a zero-copy pool buffer, return the pool slice directly
+    // without materializing to a temp file.
+    blockManager.getLocalBytes(blockId) match {
+      case Some(chunkedBuffer: IpcPoolChunkedByteBuffer) =>
+        return Some(IpcBlock(
+          chunkedBuffer.poolLength,
+          IpcPoolSlice(chunkedBuffer.poolPath, chunkedBuffer.poolOffset, chunkedBuffer.poolLength)))
+      case _ =>
     }
 
     val size = sendBlockToDaemon(context, blockId)

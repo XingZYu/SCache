@@ -69,8 +69,8 @@ public class UploadBlock extends BlockTransferMessage {
       .add("appId", appId)
       .add("execId", execId)
       .add("blockId", blockId)
-      .add("metadata size", metadata.length)
-      .add("block size", blockData.length)
+      .add("metadata size", String.valueOf(metadata.length))
+      .add("block size", String.valueOf(blockData.length))
       .toString();
   }
 

@@ -29,6 +29,7 @@ private[deploy] object DeployMessages {
   case class PutBlock(scacheBlockId: BlockId, size: Int, ipc: IpcLocation) extends FromDaemon
   case class GetBlock(scacheBlockId: BlockId) extends FromDaemon
   case class GetBlockIpc(scacheBlockId: BlockId) extends FromDaemon
+  case class GetBlocksIpc(scacheBlockIds: Seq[BlockId]) extends FromDaemon
   case class RegisterShuffle(appName: String, jobId: Int, ids: Array[Int], numMaps: Array[Int], numReduces: Array[Int]) extends FromDaemon
   case class MapEnd(appName: String, jobId: Int, shuffleId: Int, mapId: Int) extends FromDaemon
   case class GetShuffleStatus(appName: String, jobId: Int, shuffleId: Int) extends FromDaemon

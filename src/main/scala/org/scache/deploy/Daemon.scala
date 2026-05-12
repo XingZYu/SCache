@@ -112,6 +112,16 @@ class Daemon(
   }
 
   /**
+   * Allocate a generic IPC location for the given block. Unlike `preparePutBlockPool`, this may
+   * return either a detached file-backed location or a pool slice, depending on current daemon /
+   * client configuration.
+   */
+  def preparePutBlock(blockId: String, size: Int): IpcLocation = {
+    val scacheBlockId = BlockId.apply(blockId)
+    clientRef.askWithRetry[IpcLocation](PreparePutBlock(scacheBlockId, size))
+  }
+
+  /**
    * Publish a previously-prepared IPC pool slice as the final contents of the given block.
    * The SCache client will read the bytes from the IPC region and store them.
    */
@@ -122,6 +132,14 @@ class Daemon(
       scacheBlockId,
       size,
       IpcPoolSlice(resolvedPoolPath, offset, size)))
+  }
+
+  /**
+   * Publish a previously prepared generic IPC location as the final contents of the given block.
+   */
+  def commitPutBlock(blockId: String, size: Int, ipc: IpcLocation): Boolean = {
+    val scacheBlockId = BlockId.apply(blockId)
+    clientRef.askWithRetry[Boolean](PutBlock(scacheBlockId, size, ipc))
   }
 
   def putBlock(blockId: String, data: Array[Byte], rawLen: Int, compressedLen: Int): Unit = {
@@ -235,6 +253,12 @@ class Daemon(
       return None
     }
     clientRef.askWithRetry[Option[IpcBlock]](GetBlockIpc(scacheBlockId))
+  }
+
+  def getBlocksIpc(blockIds: Seq[String]): Seq[Option[IpcBlock]] = {
+    val scacheBlockIds = blockIds.map(BlockId.apply).filter(_.isInstanceOf[ScacheBlockId])
+    if (scacheBlockIds.isEmpty) return Seq.empty
+    clientRef.askWithRetry[Seq[Option[IpcBlock]]](GetBlocksIpc(scacheBlockIds))
   }
   def registerShuffles(jobId: Int, shuffleIds: Array[Int], maps: Array[Int], reduces: Array[Int]): Unit = {
     // Registration must be synchronous to ensure the shuffle is registered before returning.

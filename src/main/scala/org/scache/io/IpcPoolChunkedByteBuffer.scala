@@ -15,7 +15,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 private[scache] final class IpcPoolChunkedByteBuffer(
     chunks0: Array[ByteBuffer],
-    onDispose: () => Unit)
+    onDispose: () => Unit,
+    val poolPath: String,
+    val poolOffset: Long,
+    val poolLength: Int)
   extends ChunkedByteBuffer(chunks0) {
 
   require(onDispose != null, "onDispose must not be null")
@@ -39,6 +42,6 @@ private[scache] final class IpcPoolChunkedByteBuffer(
       dup.position(0)
       dup
     }
-    new IpcPoolChunkedByteBuffer(dups, () => ())
+    new IpcPoolChunkedByteBuffer(dups, () => (), poolPath, poolOffset, poolLength)
   }
 }

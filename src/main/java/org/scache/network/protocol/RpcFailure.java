@@ -67,7 +67,7 @@ public final class RpcFailure extends AbstractMessage implements ResponseMessage
   @Override
    public String toString() {
     return Objects.toStringHelper(this)
-      .add("requestId", requestId)
+      .add("requestId", String.valueOf(requestId))
       .add("errorString", errorString)
       .toString();
   }

@@ -69,7 +69,7 @@ public final class StreamFailure extends AbstractMessage implements ResponseMess
   @Override
   public String toString() {
     return Objects.toStringHelper(this)
-      .add("streamId", streamId)
+      .add("streamId", String.valueOf(streamId))
       .add("error", error)
       .toString();
   }

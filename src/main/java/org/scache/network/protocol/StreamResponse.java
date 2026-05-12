@@ -82,8 +82,8 @@ public final class StreamResponse extends AbstractResponseMessage {
   @Override
   public String toString() {
     return Objects.toStringHelper(this)
-      .add("streamId", streamId)
-      .add("byteCount", byteCount)
+      .add("streamId", String.valueOf(streamId))
+      .add("byteCount", String.valueOf(byteCount))
       .add("body", body())
       .toString();
   }

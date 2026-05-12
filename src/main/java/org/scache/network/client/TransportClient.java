@@ -319,7 +319,7 @@ public class TransportClient implements Closeable {
     return Objects.toStringHelper(this)
       .add("remoteAdress", channel.remoteAddress())
       .add("clientId", clientId)
-      .add("isActive", isActive())
+      .add("isActive", String.valueOf(isActive()))
       .toString();
   }
 }
