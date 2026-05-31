@@ -34,11 +34,19 @@ class Daemon(
     ExecutionContext.fromExecutorService(asyncThreadPool)
 
   private val conf = new ScacheConf(scacheHome)
-  private val clientPort = conf.getInt("scache.client.port", 5678)
+  private val clientPort: Int = {
+    val envPort = System.getenv("SCACHE_CLIENT_PORT")
+    if (envPort != null && envPort.nonEmpty) {
+      envPort.toInt
+    } else {
+      Integer.getInteger("scache.client.port", conf.getInt("scache.client.port", 5678))
+    }
+  }
   private val daemonPort = conf.getInt("scache.daemon.port", 12345)
   private val host = Utils.findLocalInetAddress().getHostAddress
   private val rpcEnv = RpcEnv.create("scache.daemon", host, daemonPort, conf, true)
-  private val clientRef = rpcEnv.setupEndpointRef(RpcAddress(host, clientPort), "ScacheClient")
+  private val clientHost = Option(System.getenv("SCACHE_CLIENT_HOST")).filter(_.nonEmpty).getOrElse(host)
+  private val clientRef = rpcEnv.setupEndpointRef(RpcAddress(clientHost, clientPort), "ScacheClient")
 
   private val putBlockAsync = conf.getBoolean("scache.daemon.putBlock.async", true)
 

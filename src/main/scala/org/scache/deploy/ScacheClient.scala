@@ -68,6 +68,10 @@ class ScacheClient(
     conf.getBoolean("scache.storage.cxl.shared.enabled", false)
   private val cxlSharedPoolPath =
     conf.getString("scache.storage.cxl.shared.pool.path", "").trim
+  // Force CXL mode: bypass isLocalConsumer check and use CXL pool for ALL pool allocations.
+  // For single-node CXL emulation testing only.
+  private val cxlSharedForce =
+    conf.getBoolean("scache.storage.cxl.shared.force", false)
 
   @volatile private var poolAllocator: PoolAllocator = null
   @volatile private var poolFile: MmapPoolFile = null
@@ -134,6 +138,28 @@ class ScacheClient(
   private def putIpcFileIn(dir: File, blockName: String): File = new File(dir, blockName)
   private def getIpcFile(blockName: String): File = new File(ipcDirGetFile, blockName)
 
+  // CXL domain topology: hostname -> domainId, lazily populated from master.
+  private val cxlDomainForHost: mutable.Map[String, String] = mutable.Map.empty
+  private var cxlDomainTopologyLoaded = false
+
+  private def loadCxlDomainTopology(): Unit = {
+    if (cxlDomainTopologyLoaded || !cxlSharedEnabled) return
+    try {
+      val domains = blockManagerMaster.getCxlDomainTopology
+      for (d <- domains; host <- d.memberHosts) {
+        cxlDomainForHost.put(host, d.domainId)
+      }
+      if (domains.nonEmpty) {
+        logInfo(s"Loaded CXL domain topology: ${domains.size} domains, " +
+          s"${cxlDomainForHost.size} host mappings")
+      }
+    } catch {
+      case e: Exception =>
+        logWarning("Failed to load CXL domain topology from master", e)
+    }
+    cxlDomainTopologyLoaded = true
+  }
+
   private def isLocalConsumer(blockId: BlockId): Boolean = blockId match {
     case bId: ScacheBlockId =>
       val shuffleKey = ShuffleKey(bId.app, bId.jobId, bId.shuffleId)
@@ -143,7 +169,18 @@ class ScacheClient(
       } else if (bId.reduceId < 0 || bId.reduceId >= status.reduceArray.length) {
         false
       } else {
-        status.reduceArray(bId.reduceId).host == hostname
+        val reduceHost = status.reduceArray(bId.reduceId).host
+        if (reduceHost == hostname) {
+          true
+        } else if (cxlSharedEnabled) {
+          // CXL-aware: if consumer and producer share a CXL domain, treat as local.
+          loadCxlDomainTopology()
+          val consumerDomain = cxlDomainForHost.get(hostname)
+          val producerDomain = cxlDomainForHost.get(reduceHost)
+          consumerDomain.isDefined && consumerDomain == producerDomain
+        } else {
+          false
+        }
       }
     case _ =>
       false
@@ -306,8 +343,8 @@ class ScacheClient(
       if (localConsumer) daemonPutStorageLevelLocal else daemonPutStorageLevelRemote
 
     ipc match {
-      case IpcPoolSlice(poolPath0, offset, _) if !localConsumer && cxlSharedEnabled &&
-          cxlSharedPoolPath.nonEmpty =>
+      case IpcPoolSlice(poolPath0, offset, _) if (!localConsumer || cxlSharedForce) &&
+          cxlSharedEnabled && cxlSharedPoolPath.nonEmpty =>
         val poolPath = if (poolPath0.nonEmpty) poolPath0 else ipcPoolPath
         if (poolPath == cxlSharedPoolPath) {
           try {
@@ -404,10 +441,11 @@ class ScacheClient(
 
     if (ipcBackend == "pool") {
       val useSharedCxlPool =
-        cxlSharedEnabled && cxlSharedPoolPath.nonEmpty && !isLocalConsumer(blockId)
+        cxlSharedEnabled && cxlSharedPoolPath.nonEmpty &&
+        (cxlSharedForce || !isLocalConsumer(blockId))
 
       if (useSharedCxlPool) {
-        blockManagerMaster.allocateCxlBlock(size) match {
+        blockManagerMaster.allocateCxlBlock("", size) match {
           case Some(loc) =>
             return IpcPoolSlice(loc.poolPath, loc.offset, loc.length)
           case None =>

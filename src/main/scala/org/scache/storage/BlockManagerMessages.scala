@@ -123,8 +123,12 @@ private[scache] object BlockManagerMessages {
   /** A location inside a shared, file-backed (fsdax) pool: (path, offset, length). */
   case class CxlBlockLocation(poolPath: String, offset: Long, length: Int) extends Serializable
 
-  /** Allocate a slice in the shared CXL pool for a block payload of `length` bytes. */
-  case class AllocateCxlBlock(length: Int) extends ToBlockManagerMaster
+  /**
+   * Allocate a slice in the shared CXL pool for a block payload of `length` bytes.
+   * @param domainId  Target CXL domain. If empty, the first registered domain is used.
+   * @param length    Requested allocation size in bytes.
+   */
+  case class AllocateCxlBlock(domainId: String, length: Int) extends ToBlockManagerMaster
 
   /** Register a committed block as residing in the shared CXL pool. */
   case class RegisterCxlBlock(blockId: BlockId, location: CxlBlockLocation) extends ToBlockManagerMaster
@@ -134,5 +138,16 @@ private[scache] object BlockManagerMessages {
 
   /** Remove a block's shared CXL pool metadata and free the slice (best effort). */
   case class ReleaseCxlBlock(blockId: BlockId) extends ToBlockManagerMaster
+
+  /** Register a CXL memory domain with its pool configuration and member hosts. */
+  case class RegisterCxlDomain(domainId: String, poolPath: String,
+      poolSize: Long, poolAlign: Int, memberHosts: Seq[String])
+      extends ToBlockManagerMaster
+
+  /** Query the topology of all registered CXL domains. */
+  case object GetCxlDomainTopology extends ToBlockManagerMaster
+
+  /** Query pool statistics for a specific CXL domain. */
+  case class GetCxlPoolStats(domainId: String) extends ToBlockManagerMaster
 
 }

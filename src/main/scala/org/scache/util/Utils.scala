@@ -407,7 +407,9 @@ private[scache] object Utils extends Logging{
   }
 
   def findLocalInetAddress(): InetAddress = {
-    val defaultIpOverride = System.getenv("SCACHE_LOCAL_IP")
+    val defaultIpOverride = Option(System.getenv("SCACHE_LOCAL_IP"))
+      .orElse(Option(System.getenv("SPARK_LOCAL_IP")))
+      .orNull
     if (defaultIpOverride != null) {
       InetAddress.getByName(defaultIpOverride)
     } else {

@@ -33,8 +33,18 @@ sbin=`cd "$sbin"; pwd`
 mkdir -p "$SCACHE_LOG_DIR" "$SCACHE_PID_DIR"
 
 MAIN_CLASS="org.scache.deploy.ScacheClient"
-PID_FILE="$SCACHE_PID_DIR/scache-client.pid"
-LOG_FILE="$SCACHE_LOG_DIR/scache-client.out"
+
+# Support multi-client mode: use port-specific PID/log files when --port is provided.
+CLIENT_PORT_SUFFIX=""
+for _a in "$@"; do
+    if [[ -n "${_prev_port:-}" ]]; then
+        CLIENT_PORT_SUFFIX="-${_a}"
+        break
+    fi
+    [[ "$_a" == "--port" || "$_a" == "-p" ]] && _prev_port=1
+done
+PID_FILE="$SCACHE_PID_DIR/scache-client${CLIENT_PORT_SUFFIX}.pid"
+LOG_FILE="$SCACHE_LOG_DIR/scache-client${CLIENT_PORT_SUFFIX}.out"
 
 find_assembly_jar() {
     if [[ -n "${SCACHE_JAR:-}" ]]; then

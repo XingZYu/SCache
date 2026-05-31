@@ -8,7 +8,18 @@ sbin=`cd "$sbin"; pwd`
 . "$sbin/config.sh"
 
 MAIN_CLASS="org.scache.deploy.ScacheClient"
-PID_FILE="$SCACHE_PID_DIR/scache-client.pid"
+
+# Support multi-client mode: look for port-specific PID files.
+# If --port is provided, stop only that client; otherwise stop all matched clients.
+CLIENT_PORT_SUFFIX=""
+for _a in "$@"; do
+    if [[ -n "${_prev_port:-}" ]]; then
+        CLIENT_PORT_SUFFIX="-${_a}"
+        break
+    fi
+    [[ "$_a" == "--port" || "$_a" == "-p" ]] && _prev_port=1
+done
+PID_FILE="$SCACHE_PID_DIR/scache-client${CLIENT_PORT_SUFFIX}.pid"
 
 is_pid_running() {
 	local pid="$1"

@@ -65,24 +65,51 @@ class BlockManagerMasterEndpoint(
 
   private val cxlStateLock = new Object
   private val cxlBlocks = new mutable.HashMap[BlockId, CxlBlockLocation]()
-  private val cxlAllocator: Option[CxlPoolAllocator] = {
-    if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty && cxlSharedPoolSizeBytes > 0) {
-      val ensuredSize = ensurePoolFileSize(cxlSharedPoolPath, cxlSharedPoolSizeBytes)
-      if (ensuredSize <= 0) {
-        logWarning(
-          s"Shared CXL pool is enabled but has invalid size=$ensuredSize; disabling shared pool.")
-        None
-      } else {
-        Some(new CxlPoolAllocator(ensuredSize, cxlSharedPoolAlignBytes))
-      }
+
+  // Multi-domain CXL support: domainId -> CxlDomainState
+  private val cxlDomains: mutable.Map[String, CxlDomainState] = mutable.Map.empty
+  // hostname -> domainId mapping for CXL-aware consumer locality
+  private val hostToCxlDomain: mutable.Map[String, String] = mutable.Map.empty
+
+  // Backward-compatible default domain initialization from legacy config.
+  if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty && cxlSharedPoolSizeBytes > 0) {
+    val ensuredSize = ensurePoolFileSize(cxlSharedPoolPath, cxlSharedPoolSizeBytes)
+    if (ensuredSize <= 0) {
+      logWarning(
+        s"Shared CXL pool is enabled but has invalid size=$ensuredSize; disabling shared pool.")
     } else {
-      if (cxlSharedEnabled) {
-        logWarning(
-          "Shared CXL pool is enabled but scache.storage.cxl.shared.pool.path/size are not set; " +
-            "disabling shared pool.")
+      val domainMembers = conf.getString(
+        "scache.storage.cxl.domain.members", "").trim
+      val memberSet: Set[String] =
+        if (domainMembers.nonEmpty) domainMembers.split(",").map(_.trim).filter(_.nonEmpty).toSet
+        else Set.empty
+      val defaultDomain = CxlMemoryDomain(
+        domainId = "default",
+        poolPath = cxlSharedPoolPath,
+        poolSizeBytes = ensuredSize,
+        poolAlignBytes = cxlSharedPoolAlignBytes,
+        memberHosts = memberSet)
+      val allocator = new CxlPoolAllocator(ensuredSize, cxlSharedPoolAlignBytes)
+      cxlDomains.put("default", CxlDomainState(defaultDomain, allocator, new File(cxlSharedPoolPath)))
+      memberSet.foreach { host =>
+        hostToCxlDomain.put(host, "default")
       }
-      None
+      logInfo(s"Initialized default CXL domain: path=$cxlSharedPoolPath size=$ensuredSize " +
+        s"members=${memberSet.mkString(",")}")
     }
+  } else if (cxlSharedEnabled) {
+    logWarning(
+      "Shared CXL pool is enabled but scache.storage.cxl.shared.pool.path/size are not set; " +
+        "disabling shared pool.")
+  }
+
+  /** Returns the first available CXL domain, if any. */
+  private def defaultCxlDomainId: Option[String] = cxlDomains.keys.headOption
+
+  /** Resolve domainId: use provided value if non-empty, otherwise fall back to default domain. */
+  private def resolveCxlDomain(domainId: String): Option[CxlDomainState] = {
+    val effectiveId = if (domainId.nonEmpty) domainId else defaultCxlDomainId.getOrElse("")
+    if (effectiveId.isEmpty) None else cxlDomains.get(effectiveId)
   }
 
   private val askThreadPool = ThreadUtils.newDaemonCachedThreadPool("block-manager-ask-thread-pool")
@@ -126,8 +153,8 @@ class BlockManagerMasterEndpoint(
     case GetMatchingBlockIds(filter, askSlaves) =>
       context.reply(getMatchingBlockIds(filter, askSlaves))
 
-    case AllocateCxlBlock(length) =>
-      context.reply(allocateCxlBlock(length))
+    case AllocateCxlBlock(domainId, length) =>
+      context.reply(allocateCxlBlock(domainId, length))
 
     case RegisterCxlBlock(blockId, location) =>
       context.reply(registerCxlBlock(blockId, location))
@@ -137,6 +164,15 @@ class BlockManagerMasterEndpoint(
 
     case ReleaseCxlBlock(blockId) =>
       context.reply(releaseCxlBlock(blockId))
+
+    case RegisterCxlDomain(domainId, poolPath, poolSize, poolAlign, memberHosts) =>
+      context.reply(registerCxlDomain(domainId, poolPath, poolSize, poolAlign, memberHosts))
+
+    case GetCxlDomainTopology =>
+      context.reply(cxlDomains.values.map(_.domain).toSeq)
+
+    case GetCxlPoolStats(domainId) =>
+      context.reply(getCxlPoolStats(domainId))
 
     case RemoveRdd(rddId) =>
       context.reply(removeRdd(rddId))
@@ -176,15 +212,62 @@ class BlockManagerMasterEndpoint(
       }
   }
 
-  private def allocateCxlBlock(length: Int): Option[CxlBlockLocation] = {
+  private def allocateCxlBlock(domainId: String, length: Int): Option[CxlBlockLocation] = {
     if (length < 0) return None
-    cxlAllocator match {
-      case Some(allocator) =>
-        allocator.allocate(length).map { offset =>
-          CxlBlockLocation(cxlSharedPoolPath, offset, length)
+    resolveCxlDomain(domainId) match {
+      case Some(state) =>
+        state.allocator.allocate(length).map { offset =>
+          CxlBlockLocation(state.domain.poolPath, offset, length)
         }
       case None =>
         None
+    }
+  }
+
+  private def registerCxlDomain(
+      domainId: String, poolPath: String, poolSize: Long, poolAlign: Int,
+      memberHosts: Seq[String]): Boolean = {
+    if (domainId == null || domainId.trim.isEmpty) return false
+    if (poolPath == null || poolPath.trim.isEmpty) return false
+    if (poolSize <= 0) return false
+    if (!cxlSharedEnabled) {
+      logWarning(s"CXL shared pool is not enabled; ignoring domain registration for $domainId")
+      return false
+    }
+    val ensuredSize = ensurePoolFileSize(poolPath, poolSize)
+    if (ensuredSize <= 0) {
+      logWarning(s"Failed to ensure CXL pool file size for domain $domainId: path=$poolPath size=$poolSize")
+      return false
+    }
+    val domain = CxlMemoryDomain(
+      domainId = domainId, poolPath = poolPath, poolSizeBytes = ensuredSize,
+      poolAlignBytes = poolAlign, memberHosts = memberHosts.toSet)
+    val allocator = new CxlPoolAllocator(ensuredSize, poolAlign)
+    val state = CxlDomainState(domain, allocator, new File(poolPath))
+    cxlDomains.put(domainId, state)
+    memberHosts.foreach { host =>
+      hostToCxlDomain.put(host, domainId)
+    }
+    logInfo(s"Registered CXL domain $domainId: path=$poolPath size=$ensuredSize members=${memberHosts.mkString(",")}")
+    true
+  }
+
+  private def getCxlPoolStats(domainId: String): Option[CxlPoolStats] = {
+    val effectiveId = if (domainId.nonEmpty) domainId else defaultCxlDomainId.getOrElse("")
+    cxlDomains.get(effectiveId).map { state =>
+      val freeBytes = state.allocator.freeBytes
+      val totalBytes = state.domain.poolSizeBytes
+      val fragmentationRatio = if (totalBytes > 0) {
+        val usedBytes = totalBytes - freeBytes
+        usedBytes.toDouble / totalBytes.toDouble
+      } else 0.0
+      CxlPoolStats(
+        domainId = effectiveId,
+        freeBytes = freeBytes,
+        totalBytes = totalBytes,
+        allocationCount = state.allocator.allocationCount,
+        freeSegmentCount = state.allocator.freeSegmentCount,
+        fragmentationRatio = fragmentationRatio)
     }
   }
 
@@ -192,8 +275,12 @@ class BlockManagerMasterEndpoint(
     if (blockId == null || location == null) return false
     if (location.length < 0 || location.offset < 0L) return false
     if (!cxlSharedEnabled) return false
-    if (cxlSharedPoolPath.isEmpty) return false
-    if (location.poolPath != cxlSharedPoolPath) return false
+    // Verify the pool path belongs to a registered domain.
+    val domainOpt = cxlDomains.values.find(_.domain.poolPath == location.poolPath)
+    if (domainOpt.isEmpty) {
+      logWarning(s"CXL block registration rejected: pool path ${location.poolPath} does not match any domain")
+      return false
+    }
     cxlStateLock.synchronized {
       cxlBlocks.put(blockId, location)
     }
@@ -212,13 +299,14 @@ class BlockManagerMasterEndpoint(
     val removed = cxlStateLock.synchronized {
       cxlBlocks.remove(blockId)
     }
-    (removed, cxlAllocator) match {
-      case (Some(loc), Some(allocator)) =>
-        allocator.free(loc.offset, loc.length)
+    removed match {
+      case Some(loc) =>
+        // Find the domain that owns this pool path and free the allocation.
+        cxlDomains.values.find(_.domain.poolPath == loc.poolPath).foreach { state =>
+          state.allocator.free(loc.offset, loc.length)
+        }
         true
-      case (Some(_), None) =>
-        true
-      case (None, _) =>
+      case None =>
         false
     }
   }
@@ -298,8 +386,10 @@ class BlockManagerMasterEndpoint(
       matches.foreach { case (bid, _) => cxlBlocks.remove(bid) }
       matches.map(_._2).toSeq
     }
-    cxlAllocator.foreach { allocator =>
-      removedLocations.foreach(loc => allocator.free(loc.offset, loc.length))
+    removedLocations.foreach { loc =>
+      cxlDomains.values.find(_.domain.poolPath == loc.poolPath).foreach { state =>
+        state.allocator.free(loc.offset, loc.length)
+      }
     }
   }
 
@@ -568,12 +658,20 @@ class BlockManagerMasterEndpoint(
  * This is intentionally lightweight: it allocates contiguous (offset, length) ranges with
  * alignment and supports best-effort free with coalescing.
  */
-private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
+private[storage] final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
   require(poolSizeBytes > 0, s"poolSizeBytes must be > 0, got $poolSizeBytes")
   require(alignBytes > 0, s"alignBytes must be > 0, got $alignBytes")
 
   private val free = new JTreeMap[java.lang.Long, java.lang.Long]()
   private var nextOffset = 0L
+  private var _allocationCount: Long = 0L
+
+  def allocationCount: Long = _allocationCount
+  def freeBytes: Long = synchronized {
+    poolSizeBytes - (if (nextOffset > 0) nextOffset else 0L) +
+      free.values().asScala.foldLeft(0L)((sum, len) => sum + len)
+  }
+  def freeSegmentCount: Int = synchronized { free.size() }
 
   private def alignUp(value: Long): Long = {
     val a = alignBytes.toLong
@@ -600,6 +698,7 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
 
     if (off + size <= poolSizeBytes) {
       nextOffset = off + size
+      _allocationCount += 1
       return Some(off)
     }
 
@@ -629,6 +728,7 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
         if (allocatedEnd < segEnd) {
           free.put(allocatedEnd, segEnd - allocatedEnd)
         }
+        _allocationCount += 1
         return Some(candidate)
       }
 

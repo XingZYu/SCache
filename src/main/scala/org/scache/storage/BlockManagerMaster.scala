@@ -222,8 +222,8 @@ class BlockManagerMaster(
   // Shared CXL (fsdax) pool metadata helpers.
   // --------------------------------------------------------------------------
 
-  def allocateCxlBlock(length: Int): Option[CxlBlockLocation] = {
-    driverEndpoint.askWithRetry[Option[CxlBlockLocation]](AllocateCxlBlock(length))
+  def allocateCxlBlock(domainId: String, length: Int): Option[CxlBlockLocation] = {
+    driverEndpoint.askWithRetry[Option[CxlBlockLocation]](AllocateCxlBlock(domainId, length))
   }
 
   def registerCxlBlock(blockId: BlockId, location: CxlBlockLocation): Boolean = {
@@ -236,6 +236,20 @@ class BlockManagerMaster(
 
   def releaseCxlBlock(blockId: BlockId): Boolean = {
     driverEndpoint.askWithRetry[Boolean](ReleaseCxlBlock(blockId))
+  }
+
+  def registerCxlDomain(domainId: String, poolPath: String, poolSize: Long,
+      poolAlign: Int, memberHosts: Seq[String]): Boolean = {
+    driverEndpoint.askWithRetry[Boolean](
+      RegisterCxlDomain(domainId, poolPath, poolSize, poolAlign, memberHosts))
+  }
+
+  def getCxlDomainTopology: Seq[CxlMemoryDomain] = {
+    driverEndpoint.askWithRetry[Seq[CxlMemoryDomain]](GetCxlDomainTopology)
+  }
+
+  def getCxlPoolStats(domainId: String): Option[CxlPoolStats] = {
+    driverEndpoint.askWithRetry[Option[CxlPoolStats]](GetCxlPoolStats(domainId))
   }
 
   /** Stop the driver endpoint, called only on the Spark driver node */

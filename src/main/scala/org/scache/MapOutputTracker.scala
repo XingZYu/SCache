@@ -198,20 +198,30 @@ private[scache] class MapOutputTrackerMaster(conf: ScacheConf, isLocal: Boolean)
     }
     val shuffleStatus = new ShuffleStatus(shuffleId, numMapTask, numReduceTask)
 
-    // apply random reduce allocation
-    val clientList = Random.shuffle(hostnameToClientId.keys.toList)
+    // reduce placement strategy: "homes" (deterministic per partition) or "random" (default)
+    val placement = conf.getString("scache.shuffle.reducePlacement", "random").trim.toLowerCase
+    val numRep = Math.min(conf.getInt("scache.shuffle.replication", 0), hostnameToClientId.size)
+    val clientList: List[String] = placement match {
+      case "homes" =>
+        // Deterministic: sort hosts so each reduce partition always maps to the same host.
+        val sorted = hostnameToClientId.keys.toList.sorted
+        logInfo(s"reducePlacement=homes: sorted client list (${sorted.size} hosts)")
+        sorted
+      case _ =>
+        // Random (current behavior)
+        Random.shuffle(hostnameToClientId.keys.toList)
+    }
     logDebug(s"Alive client list: ${clientList.size}, $clientList")
-    val numRep = Math.min(conf.getInt("scache.shuffle.replication", 0), clientList.size)
     for (i <- 0 until numReduceTask) {
       val p = i % clientList.size
       val backups = (for (c <- clientList if c != clientList(p)) yield c)
       shuffleStatus.reduceArray(i) = new ReduceStatus(i, clientList(p), Random.shuffle(backups).toArray.slice(0, numRep), numMapTask)
-      logInfo(s"Allocate shuffle ${shuffleKey.toString()} reduce $i to host ${clientList(p)}")
+      logInfo(s"Allocate shuffle ${shuffleKey.toString()} reduce $i to host ${clientList(p)} (placement=$placement)")
     }
     shuffleOutputStatus.putIfAbsent(shuffleKey, shuffleStatus)
     val mapBlocksStatus = new Array[Int](numMapTask).map(x => numReduceTask)
     shuffleMapBlocksStatus.putIfAbsent(shuffleKey, mapBlocksStatus)
-    logInfo(s"Register shuffle $appName:$jobId:$shuffleId with map:$numMapTask and reduce:$numReduceTask")
+    logInfo(s"Register shuffle $appName:$jobId:$shuffleId with map:$numMapTask and reduce:$numReduceTask placement=$placement")
 
     true
   }
