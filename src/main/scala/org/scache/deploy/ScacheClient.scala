@@ -231,9 +231,17 @@ class ScacheClient(
       doAsync[IpcLocation](s"Prepare IPC location for $blockId from daemon", context) {
         preparePutBlockFromDaemon(blockId, size)
       }
+    case PreparePutBlocks(blockIds, sizes) =>
+      doAsync[Array[IpcLocation]](s"Prepare ${blockIds.length} IPC locations from daemon", context) {
+        preparePutBlocksFromDaemon(blockIds, sizes)
+      }
     case PutBlock(blockId, size, ipc) =>
       doAsync[Boolean](s"Read block $blockId from daemon", context) {
         readBlockFromDaemon(context, blockId, size, ipc)
+      }
+    case PutBlocks(blockIds, sizes, ipcs) =>
+      doAsync[Array[Boolean]](s"Read ${blockIds.length} blocks from daemon", context) {
+        readBlocksFromDaemon(context, blockIds, sizes, ipcs)
       }
     case RegisterShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask) =>
       context.reply(registerShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask))
@@ -465,6 +473,45 @@ class ScacheClient(
         logWarning(s"Failed to prepare IPC file for block $blockId", e)
         IpcFile("")
     }
+  }
+
+  private def preparePutBlocksFromDaemon(
+      blockIds: Array[BlockId],
+      sizes: Array[Int]): Array[IpcLocation] = {
+    if (blockIds == null || sizes == null || blockIds.length != sizes.length) {
+      logWarning(
+        s"Invalid PreparePutBlocks request: blockIds=${Option(blockIds).map(_.length)} " +
+          s"sizes=${Option(sizes).map(_.length)}")
+      return Array.empty[IpcLocation]
+    }
+    val locations = new Array[IpcLocation](blockIds.length)
+    var i = 0
+    while (i < blockIds.length) {
+      locations(i) = preparePutBlockFromDaemon(blockIds(i), sizes(i))
+      i += 1
+    }
+    locations
+  }
+
+  private def readBlocksFromDaemon(
+      context: RpcCallContext,
+      blockIds: Array[BlockId],
+      sizes: Array[Int],
+      ipcs: Array[IpcLocation]): Array[Boolean] = {
+    if (blockIds == null || sizes == null || ipcs == null ||
+        blockIds.length != sizes.length || blockIds.length != ipcs.length) {
+      logWarning(
+        s"Invalid PutBlocks request: blockIds=${Option(blockIds).map(_.length)} " +
+          s"sizes=${Option(sizes).map(_.length)} ipcs=${Option(ipcs).map(_.length)}")
+      return Array.empty[Boolean]
+    }
+    val results = new Array[Boolean](blockIds.length)
+    var i = 0
+    while (i < blockIds.length) {
+      results(i) = readBlockFromDaemon(context, blockIds(i), sizes(i), ipcs(i))
+      i += 1
+    }
+    results
   }
 
   def sendBlockToDaemon(context: RpcCallContext, blockId: BlockId): Int= {

@@ -112,6 +112,32 @@ class Daemon(
   }
 
   /**
+   * Batched variant of preparePutBlockPool. Spark uses this on fixed-length shuffle write paths
+   * to reduce per-partition control-plane RPC overhead while preserving per-block storage
+   * semantics.
+   */
+  def preparePutBlocksPool(blockIds: Array[String], sizes: Array[Int]): Array[IpcPoolSlice] = {
+    if (blockIds == null || sizes == null || blockIds.length != sizes.length) {
+      throw new IllegalArgumentException(
+        s"Invalid preparePutBlocksPool request: blockIds=${Option(blockIds).map(_.length)} " +
+          s"sizes=${Option(sizes).map(_.length)}")
+    }
+    val scacheBlockIds = blockIds.map(BlockId.apply)
+    val ipcs = clientRef.askWithRetry[Array[IpcLocation]](
+      PreparePutBlocks(scacheBlockIds, sizes))
+    if (ipcs == null || ipcs.length != blockIds.length) {
+      throw new IllegalStateException(
+        s"Expected ${blockIds.length} IPC locations, got ${Option(ipcs).map(_.length)}")
+    }
+    ipcs.zip(blockIds).map {
+      case (slice: IpcPoolSlice, _) => slice
+      case (other, blockId) =>
+        throw new IllegalStateException(
+          s"Expected IpcPoolSlice for block $blockId, but got $other")
+    }
+  }
+
+  /**
    * Publish a previously-prepared IPC pool slice as the final contents of the given block.
    * The SCache client will read the bytes from the IPC region and store them.
    */
@@ -122,6 +148,34 @@ class Daemon(
       scacheBlockId,
       size,
       IpcPoolSlice(resolvedPoolPath, offset, size)))
+  }
+
+  /**
+   * Batched variant of commitPutBlockPool.
+   */
+  def commitPutBlocksPool(
+      blockIds: Array[String],
+      sizes: Array[Int],
+      poolPaths: Array[String],
+      offsets: Array[Long]): Array[Boolean] = {
+    if (blockIds == null || sizes == null || poolPaths == null || offsets == null ||
+        blockIds.length != sizes.length || blockIds.length != poolPaths.length ||
+        blockIds.length != offsets.length) {
+      throw new IllegalArgumentException(
+        s"Invalid commitPutBlocksPool request: blockIds=${Option(blockIds).map(_.length)} " +
+          s"sizes=${Option(sizes).map(_.length)} poolPaths=${Option(poolPaths).map(_.length)} " +
+          s"offsets=${Option(offsets).map(_.length)}")
+    }
+    val scacheBlockIds = blockIds.map(BlockId.apply)
+    val ipcs = new Array[IpcLocation](blockIds.length)
+    var i = 0
+    while (i < blockIds.length) {
+      val resolvedPoolPath =
+        if (poolPaths(i) != null && poolPaths(i).nonEmpty) poolPaths(i) else ipcPoolPath
+      ipcs(i) = IpcPoolSlice(resolvedPoolPath, offsets(i), sizes(i))
+      i += 1
+    }
+    clientRef.askWithRetry[Array[Boolean]](PutBlocks(scacheBlockIds, sizes, ipcs))
   }
 
   def putBlock(blockId: String, data: Array[Byte], rawLen: Int, compressedLen: Int): Unit = {
