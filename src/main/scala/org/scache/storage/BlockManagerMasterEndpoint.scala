@@ -22,12 +22,14 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
 import java.util.{HashMap => JHashMap, TreeMap => JTreeMap}
+import java.util.concurrent.atomic.AtomicLong
 
 import org.scache.MapOutputTrackerMaster
 
 import scala.collection.mutable
 import scala.collection.JavaConverters._
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future}
+import scala.util.control.NonFatal
 import org.scache.util.{ScacheConf, Logging, Utils, ThreadUtils}
 import org.scache.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, ThreadSafeRpcEndpoint}
 import org.scache.storage.BlockManagerMessages._
@@ -52,6 +54,8 @@ class BlockManagerMasterEndpoint(
 
   // Mapping from block id to the set of block managers that have the block.
   private val blockLocations = new JHashMap[BlockId, mutable.HashSet[BlockManagerId]]
+  private val prefetchSequence = new AtomicLong(0L)
+  private val prefetchResults = new mutable.ArrayBuffer[PrefetchResult]()
 
   // Shared CXL (fsdax) pool metadata: block -> (poolPath, offset, length).
   private val cxlSharedEnabled =
@@ -62,9 +66,12 @@ class BlockManagerMasterEndpoint(
     conf.getSizeAsBytes("scache.storage.cxl.shared.pool.size", "0b")
   private val cxlSharedPoolAlignBytes =
     conf.getInt("scache.storage.cxl.shared.pool.align", 4096)
+  private val cxlSharedMapChunkBytes =
+    conf.getSizeAsBytes("scache.daemon.ipc.pool.mapChunk", "256m")
 
   private val cxlStateLock = new Object
   private val cxlBlocks = new mutable.HashMap[BlockId, CxlBlockLocation]()
+  private val cxlReservations = new mutable.HashMap[BlockId, CxlBlockLocation]()
 
   // Multi-domain CXL support: domainId -> CxlDomainState
   private val cxlDomains: mutable.Map[String, CxlDomainState] = mutable.Map.empty
@@ -89,7 +96,8 @@ class BlockManagerMasterEndpoint(
         poolSizeBytes = ensuredSize,
         poolAlignBytes = cxlSharedPoolAlignBytes,
         memberHosts = memberSet)
-      val allocator = new CxlPoolAllocator(ensuredSize, cxlSharedPoolAlignBytes)
+      val allocator = new CxlPoolAllocator(
+        ensuredSize, cxlSharedPoolAlignBytes, cxlSharedMapChunkBytes)
       cxlDomains.put("default", CxlDomainState(defaultDomain, allocator, new File(cxlSharedPoolPath)))
       memberSet.foreach { host =>
         hostToCxlDomain.put(host, "default")
@@ -117,9 +125,15 @@ class BlockManagerMasterEndpoint(
     ExecutionContext.fromExecutorService(askThreadPool)
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-    case RegisterBlockManager(blockManagerId, maxMemSize, slaveEndpoint) =>
-      register(blockManagerId, maxMemSize, slaveEndpoint)
+    case RegisterBlockManager(blockManagerId, maxMemSize, slaveEndpoint, capability) =>
+      register(blockManagerId, maxMemSize, slaveEndpoint, capability)
       context.reply(true)
+
+    case GetBlockManagerCapabilities =>
+      context.reply(blockManagerInfo.values.map(_.capability).toSeq)
+
+    case GetPrefetchResults =>
+      context.reply(prefetchResults.synchronized(prefetchResults.toVector))
 
     case _updateBlockInfo @
         UpdateBlockInfo(blockManagerId, blockId, storageLevel, deserializedSize, size) =>
@@ -156,6 +170,15 @@ class BlockManagerMasterEndpoint(
     case AllocateCxlBlock(domainId, length) =>
       context.reply(allocateCxlBlock(domainId, length))
 
+    case AllocateCxlBlocks(domainId, lengths) =>
+      context.reply(allocateCxlBlocks(domainId, lengths))
+
+    case ReserveCxlBlock(blockId, domainId, length) =>
+      context.reply(reserveCxlBlock(blockId, domainId, length))
+
+    case ReserveCxlBlocks(blockIds, domainId, lengths) =>
+      context.reply(reserveCxlBlocks(blockIds, domainId, lengths))
+
     case RegisterCxlBlock(blockId, location) =>
       context.reply(registerCxlBlock(blockId, location))
 
@@ -164,6 +187,12 @@ class BlockManagerMasterEndpoint(
 
     case ReleaseCxlBlock(blockId) =>
       context.reply(releaseCxlBlock(blockId))
+
+    case ReleaseCxlAppShuffle(appName, shuffleId) =>
+      context.reply(releaseCxlBlocksForAppShuffle(appName, shuffleId))
+
+    case ReleaseCxlApplication(appName) =>
+      context.reply(releaseCxlBlocksForApplication(appName))
 
     case RegisterCxlDomain(domainId, poolPath, poolSize, poolAlign, memberHosts) =>
       context.reply(registerCxlDomain(domainId, poolPath, poolSize, poolAlign, memberHosts))
@@ -224,6 +253,53 @@ class BlockManagerMasterEndpoint(
     }
   }
 
+  private def allocateCxlBlocks(domainId: String, lengths: Seq[Int]): Seq[Option[CxlBlockLocation]] = {
+    resolveCxlDomain(domainId) match {
+      case Some(state) =>
+        val poolPath = state.domain.poolPath
+        val offsets = state.allocator.allocateMultiple(lengths)
+        offsets.zip(lengths).map {
+          case (Some(offset), len) => Some(CxlBlockLocation(poolPath, offset, len))
+          case (None, _) => None
+        }
+      case None =>
+        lengths.map(_ => None)
+    }
+  }
+
+  private def freeCxlLocation(location: CxlBlockLocation): Unit = {
+    cxlDomains.values.find(_.domain.poolPath == location.poolPath).foreach { state =>
+      state.allocator.free(location.offset, location.length)
+    }
+  }
+
+  private def trackCxlReservation(
+      blockId: BlockId, location: CxlBlockLocation): CxlBlockLocation = {
+    val replaced = cxlStateLock.synchronized {
+      cxlReservations.put(blockId, location)
+    }
+    replaced.filter(_ != location).foreach(freeCxlLocation)
+    location
+  }
+
+  private def reserveCxlBlock(
+      blockId: BlockId, domainId: String, length: Int): Option[CxlBlockLocation] = {
+    if (blockId == null) return None
+    allocateCxlBlock(domainId, length).map(trackCxlReservation(blockId, _))
+  }
+
+  private def reserveCxlBlocks(
+      blockIds: Seq[BlockId],
+      domainId: String,
+      lengths: Seq[Int]): Seq[Option[CxlBlockLocation]] = {
+    if (blockIds.size != lengths.size) return lengths.map(_ => None)
+    allocateCxlBlocks(domainId, lengths).zip(blockIds).map {
+      case (Some(location), blockId) if blockId != null =>
+        Some(trackCxlReservation(blockId, location))
+      case _ => None
+    }
+  }
+
   private def registerCxlDomain(
       domainId: String, poolPath: String, poolSize: Long, poolAlign: Int,
       memberHosts: Seq[String]): Boolean = {
@@ -242,7 +318,7 @@ class BlockManagerMasterEndpoint(
     val domain = CxlMemoryDomain(
       domainId = domainId, poolPath = poolPath, poolSizeBytes = ensuredSize,
       poolAlignBytes = poolAlign, memberHosts = memberHosts.toSet)
-    val allocator = new CxlPoolAllocator(ensuredSize, poolAlign)
+    val allocator = new CxlPoolAllocator(ensuredSize, poolAlign, cxlSharedMapChunkBytes)
     val state = CxlDomainState(domain, allocator, new File(poolPath))
     cxlDomains.put(domainId, state)
     memberHosts.foreach { host =>
@@ -281,9 +357,12 @@ class BlockManagerMasterEndpoint(
       logWarning(s"CXL block registration rejected: pool path ${location.poolPath} does not match any domain")
       return false
     }
-    cxlStateLock.synchronized {
-      cxlBlocks.put(blockId, location)
+    val (reservation, replaced) = cxlStateLock.synchronized {
+      (cxlReservations.remove(blockId), cxlBlocks.put(blockId, location))
     }
+    // A retried/recomputed map task can publish the same logical block again. The metadata
+    // map keeps only the newest slice, so the superseded allocation must be returned here.
+    Seq(reservation, replaced).flatten.filter(_ != location).distinct.foreach(freeCxlLocation)
     true
   }
 
@@ -297,18 +376,10 @@ class BlockManagerMasterEndpoint(
   private def releaseCxlBlock(blockId: BlockId): Boolean = {
     if (blockId == null) return false
     val removed = cxlStateLock.synchronized {
-      cxlBlocks.remove(blockId)
+      Seq(cxlBlocks.remove(blockId), cxlReservations.remove(blockId)).flatten.distinct
     }
-    removed match {
-      case Some(loc) =>
-        // Find the domain that owns this pool path and free the allocation.
-        cxlDomains.values.find(_.domain.poolPath == loc.poolPath).foreach { state =>
-          state.allocator.free(loc.offset, loc.length)
-        }
-        true
-      case None =>
-        false
-    }
+    removed.foreach(freeCxlLocation)
+    removed.nonEmpty
   }
 
   private def ensurePoolFileSize(path: String, desiredSizeBytes: Long): Long = {
@@ -380,17 +451,53 @@ class BlockManagerMasterEndpoint(
   private def releaseCxlBlocksForShuffle(shuffleId: Int): Unit = {
     if (!cxlSharedEnabled) return
     val removedLocations = cxlStateLock.synchronized {
-      val matches = cxlBlocks.collect {
+      val committed = cxlBlocks.collect {
         case (bid: ScacheBlockId, loc) if bid.shuffleId == shuffleId => (bid, loc)
       }.toArray
-      matches.foreach { case (bid, _) => cxlBlocks.remove(bid) }
-      matches.map(_._2).toSeq
+      val reserved = cxlReservations.collect {
+        case (bid: ScacheBlockId, loc) if bid.shuffleId == shuffleId => (bid, loc)
+      }.toArray
+      committed.foreach { case (bid, _) => cxlBlocks.remove(bid) }
+      reserved.foreach { case (bid, _) => cxlReservations.remove(bid) }
+      (committed.map(_._2) ++ reserved.map(_._2)).distinct.toSeq
     }
-    removedLocations.foreach { loc =>
-      cxlDomains.values.find(_.domain.poolPath == loc.poolPath).foreach { state =>
-        state.allocator.free(loc.offset, loc.length)
-      }
+    removedLocations.foreach(freeCxlLocation)
+  }
+
+  private def releaseCxlBlocksForAppShuffle(appName: String, shuffleId: Int): Int = {
+    if (!cxlSharedEnabled || appName == null || appName.isEmpty) return 0
+    val removedLocations = cxlStateLock.synchronized {
+      val committed = cxlBlocks.collect {
+        case (bid: ScacheBlockId, loc)
+            if bid.app == appName && bid.shuffleId == shuffleId => (bid, loc)
+      }.toArray
+      val reserved = cxlReservations.collect {
+        case (bid: ScacheBlockId, loc)
+            if bid.app == appName && bid.shuffleId == shuffleId => (bid, loc)
+      }.toArray
+      committed.foreach { case (bid, _) => cxlBlocks.remove(bid) }
+      reserved.foreach { case (bid, _) => cxlReservations.remove(bid) }
+      (committed.map(_._2) ++ reserved.map(_._2)).distinct.toSeq
     }
+    removedLocations.foreach(freeCxlLocation)
+    removedLocations.size
+  }
+
+  private def releaseCxlBlocksForApplication(appName: String): Int = {
+    if (!cxlSharedEnabled || appName == null || appName.isEmpty) return 0
+    val removedLocations = cxlStateLock.synchronized {
+      val committed = cxlBlocks.collect {
+        case (bid: ScacheBlockId, loc) if bid.app == appName => (bid, loc)
+      }.toArray
+      val reserved = cxlReservations.collect {
+        case (bid: ScacheBlockId, loc) if bid.app == appName => (bid, loc)
+      }.toArray
+      committed.foreach { case (bid, _) => cxlBlocks.remove(bid) }
+      reserved.foreach { case (bid, _) => cxlReservations.remove(bid) }
+      (committed.map(_._2) ++ reserved.map(_._2)).distinct.toSeq
+    }
+    removedLocations.foreach(freeCxlLocation)
+    removedLocations.size
   }
 
   /**
@@ -532,7 +639,27 @@ class BlockManagerMasterEndpoint(
     ).map(_.flatten.toSeq)
   }
 
-  private def register(id: BlockManagerId, maxMemSize: Long, slaveEndpoint: RpcEndpointRef) {
+  private def validateCapability(id: BlockManagerId, capability: BlockManagerCapability): Unit = {
+    require(capability != null, s"Missing capability for $id")
+    require(capability.protocolVersion == 1,
+      s"Unsupported BlockManager capability protocol ${capability.protocolVersion} for $id")
+    require(capability.blockManagerId == id,
+      s"Capability BlockManagerId ${capability.blockManagerId} does not match registration $id")
+    require(capability.nodeEpoch != null && capability.nodeEpoch.nonEmpty,
+      s"Missing node epoch for $id")
+    require(Set("netty", "ub").contains(capability.backend),
+      s"Unsupported backend ${capability.backend} for $id")
+    require(capability.remoteFetchSupported == capability.networkEnabled,
+      s"Contradictory network capability for $id: networkEnabled=${capability.networkEnabled} " +
+        s"remoteFetchSupported=${capability.remoteFetchSupported}")
+  }
+
+  private def register(
+      id: BlockManagerId,
+      maxMemSize: Long,
+      slaveEndpoint: RpcEndpointRef,
+      capability: BlockManagerCapability) {
+    validateCapability(id, capability)
     val time = System.currentTimeMillis()
     if (!blockManagerInfo.contains(id)) {
       blockManagerIdByExecutor.get(id.executorId) match {
@@ -549,8 +676,16 @@ class BlockManagerMasterEndpoint(
       blockManagerIdByExecutor(id.executorId) = id
 
       blockManagerInfo(id) = new BlockManagerInfo(
-        id, System.currentTimeMillis(), maxMemSize, slaveEndpoint)
+        id, System.currentTimeMillis(), maxMemSize, slaveEndpoint, capability)
+    } else {
+      blockManagerInfo(id).capability = capability
     }
+    logDebug(s"SCACHE_CAPABILITY_REGISTERED blockManagerId=$id " +
+      s"protocolVersion=${capability.protocolVersion} nodeEpoch=${capability.nodeEpoch} " +
+      s"backend=${capability.backend} networkEnabled=${capability.networkEnabled} " +
+      s"remoteFetchSupported=${capability.remoteFetchSupported} " +
+      s"sharedCxlEnabled=${capability.sharedCxlEnabled} " +
+      s"rpc=${capability.rpcHost}:${capability.rpcPort}")
     // listenerBus.post(ScacheListenerBlockManagerAdded(time, id, maxMemSize))
   }
 
@@ -587,13 +722,42 @@ class BlockManagerMasterEndpoint(
       // update block status in mapoutputtracker, it may trigger the map pre-fetch
       if (mapOutputTrackerMaster.updateMapBlocksStatus(blockId) == 0) {
         val sbId = blockId.asInstanceOf[ScacheBlockId]
-        logInfo(s"Start map fetch notification for ${sbId.app}_${sbId.shuffleId}_${sbId.mapId}")
+        val correlationId = s"prefetch-${sbId.app}-${sbId.jobId}-${sbId.shuffleId}-" +
+          s"${sbId.mapId}-${prefetchSequence.incrementAndGet()}"
+        logDebug(s"SCACHE_PREFETCH_DECISION correlationId=$correlationId decision=MAP_COMPLETE " +
+          s"source=$blockManagerId app=${sbId.app} jobId=${sbId.jobId} " +
+          s"shuffleId=${sbId.shuffleId} mapId=${sbId.mapId}")
         Future {
           for (info <- blockManagerInfo.values) {
-            val res = info.slaveEndpoint.askWithRetry[Boolean](StartMapFetch(blockManagerId, sbId.app, sbId.jobId, sbId.shuffleId, sbId.mapId))
-            if (!res) {
-              logError(s"Start map fetch notification failed on ${info.blockManagerId.host}")
+            val result = if (info.blockManagerId == blockManagerId) {
+              PrefetchResult(correlationId, "SKIPPED_LOCAL_SOURCE", blockManagerId,
+                info.blockManagerId, 0, 0, 0, 0, 0L, 0L)
+            } else if (!info.capability.remoteFetchSupported || !info.capability.networkEnabled) {
+              PrefetchResult(correlationId, "SKIPPED_CAPABILITY_DISABLED", blockManagerId,
+                info.blockManagerId, 0, 0, 0, 0, 0L, 0L,
+                "RemoteFetchDisabled", "registered capability disables remote fetch")
+            } else {
+              try {
+                info.slaveEndpoint.askWithRetry[PrefetchResult](StartMapFetch(
+                  blockManagerId, sbId.app, sbId.jobId, sbId.shuffleId, sbId.mapId, correlationId))
+              } catch {
+                case NonFatal(e) =>
+                  var root = e
+                  while (root.getCause != null && (root.getCause ne root)) root = root.getCause
+                  val attempts = conf.getInt("scache.rpc.numRetries", 3) + 1
+                  PrefetchResult(correlationId, "FAILED", blockManagerId,
+                    info.blockManagerId, 0, 0, 0, 1, 0L, 0L,
+                    root.getClass.getName,
+                    s"operation=start-map-fetch source=$blockManagerId " +
+                      s"target=${info.blockManagerId} " +
+                      s"targetEndpoint=${info.capability.rpcHost}:${info.capability.rpcPort} " +
+                      s"attempt=$attempts/$attempts " +
+                      s"configuredTimeout=${conf.getString("scache.rpc.askTimeout", "120s")} " +
+                      s"rootCause=${root.getClass.getName}:" +
+                      Option(root.getMessage).getOrElse(""))
+              }
             }
+            recordPrefetchResult(result)
           }
         }
       }
@@ -610,6 +774,19 @@ class BlockManagerMasterEndpoint(
       blockLocations.remove(blockId)
     }
     true
+  }
+
+  private def recordPrefetchResult(result: PrefetchResult): Unit = {
+    prefetchResults.synchronized {
+      prefetchResults += result
+      if (prefetchResults.size > 10000) prefetchResults.remove(0, prefetchResults.size - 10000)
+    }
+    logDebug(s"SCACHE_PREFETCH_MASTER_RESULT correlationId=${result.correlationId} " +
+      s"status=${result.status} source=${result.sourceBlockManagerId} " +
+      s"target=${result.targetBlockManagerId} submitted=${result.submitted} " +
+      s"completed=${result.completed} failed=${result.failed} " +
+      s"payloadBytes=${result.payloadBytes} elapsedMs=${result.elapsedMs} " +
+      s"errorType=${result.errorType} errorMessage=${result.errorMessage}")
   }
 
   private def getLocations(blockId: BlockId): Seq[BlockManagerId] = {
@@ -658,9 +835,13 @@ class BlockManagerMasterEndpoint(
  * This is intentionally lightweight: it allocates contiguous (offset, length) ranges with
  * alignment and supports best-effort free with coalescing.
  */
-private[storage] final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
+private[storage] final class CxlPoolAllocator(
+    poolSizeBytes: Long,
+    alignBytes: Int,
+    mapChunkBytes: Long) {
   require(poolSizeBytes > 0, s"poolSizeBytes must be > 0, got $poolSizeBytes")
   require(alignBytes > 0, s"alignBytes must be > 0, got $alignBytes")
+  require(mapChunkBytes > 0, s"mapChunkBytes must be > 0, got $mapChunkBytes")
 
   private val free = new JTreeMap[java.lang.Long, java.lang.Long]()
   private var nextOffset = 0L
@@ -679,10 +860,21 @@ private[storage] final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: I
     ((value + a - 1) / a) * a
   }
 
-  def allocate(size: Int): Option[Long] = synchronized {
+  private def chunkEnd(offset: Long): Long = {
+    val start = (offset / mapChunkBytes) * mapChunkBytes
+    Math.min(start + mapChunkBytes, poolSizeBytes)
+  }
+
+  /** Batch-allocate multiple slices in a single synchronized block. */
+  def allocateMultiple(sizes: Seq[Int]): Seq[Option[Long]] = synchronized {
+    sizes.map(allocateUnsafe)
+  }
+
+  /** Allocate without acquiring the lock — caller must hold `synchronized`. */
+  private def allocateUnsafe(size: Int): Option[Long] = {
     if (size < 0) return None
     if (size == 0) return Some(0L)
-    if (size.toLong > poolSizeBytes) return None
+    if (size.toLong > poolSizeBytes || size.toLong > mapChunkBytes) return None
 
     allocateFromFree(size) match {
       case some @ Some(_) => return some
@@ -695,6 +887,12 @@ private[storage] final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: I
     val aligned = alignUp(off)
     if (aligned > off) insertFree(off, aligned - off)
     off = aligned
+
+    while (off < poolSizeBytes && off + size > chunkEnd(off)) {
+      val end = chunkEnd(off)
+      insertFree(off, end - off)
+      off = alignUp(end)
+    }
 
     if (off + size <= poolSizeBytes) {
       nextOffset = off + size
@@ -710,6 +908,10 @@ private[storage] final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: I
     allocateFromFree(size)
   }
 
+  def allocate(size: Int): Option[Long] = synchronized {
+    allocateUnsafe(size)
+  }
+
   private def allocateFromFree(size: Int): Option[Long] = {
     var entry = free.firstEntry()
     while (entry != null) {
@@ -717,8 +919,15 @@ private[storage] final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: I
       val segLen = entry.getValue.longValue()
       val segEnd = segOffset + segLen
 
-      val candidate = alignUp(segOffset)
-      if (candidate >= segOffset && candidate + size <= segEnd) {
+      val candidate1 = alignUp(segOffset)
+      val candidate =
+        if (candidate1 + size <= segEnd && candidate1 + size <= chunkEnd(candidate1)) {
+          candidate1
+        } else {
+          alignUp(chunkEnd(candidate1))
+        }
+      if (candidate >= segOffset && candidate + size <= segEnd &&
+          candidate + size <= chunkEnd(candidate)) {
         free.remove(entry.getKey)
 
         if (candidate > segOffset) {
@@ -784,7 +993,8 @@ private[scache] class BlockManagerInfo(
     val blockManagerId: BlockManagerId,
     timeMs: Long,
     val maxMem: Long,
-    val slaveEndpoint: RpcEndpointRef)
+    val slaveEndpoint: RpcEndpointRef,
+    var capability: BlockManagerCapability)
   extends Logging {
 
   private var _lastSeenMs: Long = timeMs

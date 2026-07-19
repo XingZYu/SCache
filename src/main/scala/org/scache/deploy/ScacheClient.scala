@@ -6,6 +6,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.channels.FileChannel.MapMode
 import java.nio.file.StandardOpenOption
+import java.util.UUID
 import java.util.concurrent.{TimeoutException, TimeUnit}
 
 import org.apache.commons.httpclient.util.TimeoutController.TimeoutException
@@ -38,6 +39,8 @@ class ScacheClient(
   val port: Int,
   conf: ScacheConf) extends ThreadSafeRpcEndpoint with Logging {
    conf.set("scache.client.port", rpcEnv.address.port.toString)
+  val nodeEpoch: String = conf.getString("scache.client.nodeEpoch", UUID.randomUUID().toString)
+  conf.set("scache.client.nodeEpoch", nodeEpoch, slient = true)
 
   private val ipcBackend = conf.getString("scache.daemon.ipc.backend", "files").trim.toLowerCase
   private val ipcMode = conf.getString("scache.daemon.ipc.mode", "remote").trim.toLowerCase
@@ -222,7 +225,17 @@ class ScacheClient(
         UnifiedMemoryManager(conf, numUsableCores)
       }
 
-  val blockTransferService = new NettyBlockTransferService(conf, hostname, numUsableCores)
+  private val configuredBackend =
+    conf.getString("scache.blockTransfer.backend", "netty").trim.toLowerCase
+  val blockTransferService = configuredBackend match {
+    case "ub" =>
+      logInfo("Using UB (URMA) BlockTransferService backend")
+      new org.scache.network.ub.UBBlockTransferService(conf, hostname, numUsableCores)
+    case "netty" =>
+      new NettyBlockTransferService(conf, hostname, numUsableCores)
+    case other =>
+      throw new IllegalArgumentException(s"Unsupported scache.blockTransfer.backend=$other")
+  }
 
 
   val blockManagerMasterEndpoint = RpcUtils.makeDriverRef(BlockManagerMaster.DRIVER_ENDPOINT_NAME, conf, rpcEnv)
@@ -237,6 +250,11 @@ class ScacheClient(
       serializerManager, conf, memoryManager, mapOutputTracker, blockTransferService, numUsableCores)
     logInfo(s"Got ID ${clientId} from master")
     blockManager.initialize()
+    val networkEnabled = conf.getBoolean("scache.storage.network.enabled", true)
+    logInfo(s"SCACHE_CLIENT_READY nodeEpoch=$nodeEpoch clientId=$clientId rpc=${rpcEnv.address} " +
+      s"blockManagerId=${blockManager.blockManagerId} backend=$configuredBackend " +
+      s"networkEnabled=$networkEnabled remoteFetchSupported=$networkEnabled " +
+      s"sharedCxlEnabled=$cxlSharedEnabled")
   }
 
 
@@ -264,16 +282,60 @@ class ScacheClient(
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+    case ClientHello(protocolVersion, correlationId) =>
+      if (protocolVersion != 1) {
+        context.sendFailure(new IllegalArgumentException(
+          s"Unsupported daemon protocolVersion=$protocolVersion correlationId=$correlationId"))
+      } else if (blockManager == null || blockManager.blockManagerId == null || clientId < 0) {
+        context.sendFailure(new IllegalStateException(
+          s"ScacheClient is not ready correlationId=$correlationId nodeEpoch=$nodeEpoch"))
+      } else {
+        val networkEnabled = conf.getBoolean("scache.storage.network.enabled", true)
+        val identity = ClientIdentity(
+          protocolVersion = 1,
+          nodeEpoch = nodeEpoch,
+          clientId = clientId,
+          rpcHost = rpcEnv.address.host,
+          rpcPort = rpcEnv.address.port,
+          blockManagerId = blockManager.blockManagerId,
+          backend = configuredBackend,
+          networkEnabled = networkEnabled,
+          remoteFetchSupported = networkEnabled,
+          sharedCxlEnabled = cxlSharedEnabled)
+        logDebug(s"SCACHE_CLIENT_HELLO correlationId=$correlationId nodeEpoch=$nodeEpoch " +
+          s"clientId=$clientId rpc=${rpcEnv.address} blockManagerId=${blockManager.blockManagerId} " +
+          s"backend=$configuredBackend networkEnabled=$networkEnabled " +
+          s"remoteFetchSupported=$networkEnabled sharedCxlEnabled=$cxlSharedEnabled")
+        context.reply(identity)
+      }
+
     case PreparePutBlock(blockId, size) =>
       doAsync[IpcLocation](s"Prepare IPC location for $blockId from daemon", context) {
         preparePutBlockFromDaemon(blockId, size)
+      }
+    case PreparePutBlocks(blockIds, sizes) =>
+      doAsync[Seq[Option[IpcLocation]]](s"Batch prepare ${blockIds.size} blocks", context) {
+        preparePutBlocksFromDaemon(blockIds, sizes).map {
+          case loc: IpcLocation => Some(loc)
+          case _ => None
+        }
       }
     case PutBlock(blockId, size, ipc) =>
       doAsync[Boolean](s"Read block $blockId from daemon", context) {
         readBlockFromDaemon(context, blockId, size, ipc)
       }
+    case PutBlocks(msgs) =>
+      doAsync[Seq[Boolean]](s"Batch read ${msgs.size} blocks from daemon", context) {
+        msgs.map { case PutBlock(blockId, size, ipc) =>
+          readBlockFromDaemon(context, blockId, size, ipc)
+        }
+      }
     case RegisterShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask) =>
       context.reply(registerShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask))
+    case ReleaseShuffle(appName, shuffleId) =>
+      context.reply(blockManagerMaster.releaseCxlAppShuffle(appName, shuffleId))
+    case ReleaseApplication(appName) =>
+      context.reply(blockManagerMaster.releaseCxlApplication(appName))
     case GetShuffleStatus(appName, jobId, shuffleId) =>
       context.reply(getShuffleStatus(appName, jobId, shuffleId))
     case GetBlock(blockId) =>
@@ -445,7 +507,7 @@ class ScacheClient(
         (cxlSharedForce || !isLocalConsumer(blockId))
 
       if (useSharedCxlPool) {
-        blockManagerMaster.allocateCxlBlock("", size) match {
+        blockManagerMaster.reserveCxlBlock(blockId, "", size) match {
           case Some(loc) =>
             return IpcPoolSlice(loc.poolPath, loc.offset, loc.length)
           case None =>
@@ -513,7 +575,30 @@ class ScacheClient(
     }
   }
 
-  def sendBlockToDaemon(context: RpcCallContext, blockId: BlockId): Int= {
+  /** Batch allocate CXL pool slices: one RPC to Master for all blocks. */
+  def preparePutBlocksFromDaemon(blockIds: Seq[BlockId], sizes: Seq[Int]): Seq[IpcLocation] = {
+    require(blockIds.size == sizes.size, s"blockIds.size=${blockIds.size} != sizes.size=${sizes.size}")
+    if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty) {
+      val locs = blockManagerMaster.reserveCxlBlocks(blockIds, "", sizes.toSeq)
+      return locs.zip(sizes).map {
+        case (Some(loc), len) => IpcPoolSlice(loc.poolPath, loc.offset, len)
+        case (None, len) =>
+          logWarning(s"Batch CXL pool allocation failed for size=$len; falling back to file IPC")
+          IpcFile("")
+      }
+    }
+    // Fallback: allocate individually from local IPC pool
+    blockIds.zip(sizes).map { case (bid, sz) => preparePutBlockFromDaemon(bid, sz) }
+  }
+
+  def sendBlockToDaemon(context: RpcCallContext, blockId: BlockId): Int = {
+    sendBlockToDaemonFile(context, blockId, getIpcFile(blockId.toString))
+  }
+
+  private def sendBlockToDaemonFile(
+      context: RpcCallContext,
+      blockId: BlockId,
+      ipcFile: File): Int = {
     val sleepMS = 100
     val retryTimes = conf.getInt("scache.block.fetching.retry", 5)
     val networkEnabled = conf.getBoolean("scache.storage.network.enabled", true)
@@ -541,9 +626,8 @@ class ScacheClient(
             case Some(loc) if loc.length >= 0 && loc.offset >= 0L &&
                 loc.poolPath != null && loc.poolPath.nonEmpty =>
               try {
-                val f = getIpcFile(blockId.toString)
                 val outCh = FileChannel.open(
-                  f.toPath,
+                  ipcFile.toPath,
                   StandardOpenOption.READ,
                   StandardOpenOption.WRITE,
                   StandardOpenOption.CREATE,
@@ -603,12 +687,13 @@ class ScacheClient(
           } finally {
             if (fetchedRemotely) {
               try buffer.dispose() catch { case _: Exception => }
+            } else {
+              blockManager.releaseLock(blockId)
             }
           }
 
-          val f = getIpcFile(blockId.toString)
           val channel = FileChannel.open(
-            f.toPath,
+            ipcFile.toPath,
             StandardOpenOption.READ,
             StandardOpenOption.WRITE,
             StandardOpenOption.CREATE,
@@ -654,16 +739,32 @@ class ScacheClient(
     // without materializing to a temp file.
     blockManager.getLocalBytes(blockId) match {
       case Some(chunkedBuffer: IpcPoolChunkedByteBuffer) =>
-        return Some(IpcBlock(
-          chunkedBuffer.poolLength,
-          IpcPoolSlice(chunkedBuffer.poolPath, chunkedBuffer.poolOffset, chunkedBuffer.poolLength)))
+        try {
+          return Some(IpcBlock(
+            chunkedBuffer.poolLength,
+            IpcPoolSlice(chunkedBuffer.poolPath, chunkedBuffer.poolOffset, chunkedBuffer.poolLength)))
+        } finally {
+          blockManager.releaseLock(blockId)
+        }
+      case Some(_) =>
+        blockManager.releaseLock(blockId)
       case _ =>
     }
 
-    val size = sendBlockToDaemon(context, blockId)
-    if (size < 0) return None
-    if (size == 0) return Some(IpcBlock(0, IpcFile("")))
-    Some(IpcBlock(size, IpcFile(getIpcFile(blockId.toString).getAbsolutePath)))
+    // GetBlockIpc responses hand ownership of the materialized file to the caller, which deletes
+    // it after consumption. A fixed per-block filename lets concurrent readers delete or truncate
+    // each other's file, so every response must use its own path.
+    val ipcFile = getIpcFile(s"${blockId.toString}-${UUID.randomUUID()}")
+    val size = sendBlockToDaemonFile(context, blockId, ipcFile)
+    if (size < 0) {
+      ipcFile.delete()
+      return None
+    }
+    if (size == 0) {
+      ipcFile.delete()
+      return Some(IpcBlock(0, IpcFile("")))
+    }
+    Some(IpcBlock(size, IpcFile(ipcFile.getAbsolutePath)))
   }
 
   private def getShuffleStatus(blockId: BlockId): ShuffleStatus = {
@@ -753,7 +854,6 @@ object ScacheClient extends Logging{
 
     val hostName = Utils.findLocalInetAddress().getHostName
     System.setProperty("SCACHE_DAEMON", s"client-${hostName}")
-    conf.set("scache.rpc.askTimeout", "10")
     logInfo("Start Client")
     conf.set("scache.driver.host", arguements.masterIp)
     conf.set("scache.driver.port", arguements.masterPort.toString)

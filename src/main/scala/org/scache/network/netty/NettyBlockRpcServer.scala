@@ -42,7 +42,8 @@ import org.scache.storage.{BlockId, StorageLevel}
 class NettyBlockRpcServer(
     appId: String,
     serializer: Serializer,
-    blockManager: BlockDataManager)
+    blockManager: BlockDataManager,
+    metrics: Option[NettyBlockTransferMetrics] = None)
   extends RpcHandler with Logging {
 
   private val streamManager = new OneForOneStreamManager()
@@ -58,6 +59,7 @@ class NettyBlockRpcServer(
       case openBlocks: OpenBlocks =>
         val blocks: Seq[ManagedBuffer] =
           openBlocks.blockIds.map(BlockId.apply).map(blockManager.getBlockData)
+        metrics.foreach(_.recordServerOpen(blocks.size, blocks.map(_.size).sum))
         val streamId = streamManager.registerStream(appId, blocks.iterator.asJava)
         logTrace(s"Registered streamId $streamId with ${blocks.size} buffers")
         responseContext.onSuccess(new StreamHandle(streamId, blocks.size).toByteBuffer)

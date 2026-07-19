@@ -95,7 +95,7 @@ private[scache] trait Logging {
         Option(System.getProperty("SCACHE_HOME"))
           .filter(_.nonEmpty)
           .orElse(sys.env.get("SCACHE_HOME"))
-          .getOrElse("/home/spark/SCache")
+          .getOrElse(System.getProperty("user.dir", "."))
       } else {
         _logDir
       }

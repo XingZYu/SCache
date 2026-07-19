@@ -47,7 +47,10 @@ class ScacheConf(var home: String) extends Logging {
 
 
   def this() {
-    this(sys.env.get("SCACHE_HOME").getOrElse("/home/spark/SCache"))
+    this(sys.env.get("SCACHE_HOME")
+      .orElse(Option(System.getProperty("SCACHE_HOME")).filter(_.nonEmpty))
+      .getOrElse(throw new IllegalStateException(
+        "SCACHE_HOME must be set explicitly for the SCache process")))
   }
 
 

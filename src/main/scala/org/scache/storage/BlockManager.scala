@@ -19,7 +19,8 @@ package org.scache.storage
 
 import java.io._
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
 import com.google.common.io.ByteStreams
 import org.scache.memory.MemoryMode
@@ -155,6 +156,7 @@ private[scache] class BlockManager(
   // }
 
   var blockManagerId: BlockManagerId = _
+  private var blockManagerCapability: BlockManagerMessages.BlockManagerCapability = _
 
   // Address of the server that serves this executor's shuffle files. This is either an external
   // service, or just our own Executor's BlockManager.
@@ -206,6 +208,20 @@ private[scache] class BlockManager(
     blockManagerId = BlockManagerId(
       executorId, blockTransferService.hostName, blockTransferService.port)
 
+    val backend = conf.getString("scache.blockTransfer.backend", "netty").trim.toLowerCase
+    val networkEnabled = conf.getBoolean("scache.storage.network.enabled", true)
+    blockManagerCapability = BlockManagerMessages.BlockManagerCapability(
+      protocolVersion = 1,
+      nodeEpoch = conf.getString("scache.client.nodeEpoch", "unknown"),
+      clientId = executorId,
+      blockManagerId = blockManagerId,
+      backend = backend,
+      networkEnabled = networkEnabled,
+      remoteFetchSupported = networkEnabled && (backend == "netty" || backend == "ub"),
+      sharedCxlEnabled = conf.getBoolean("scache.storage.cxl.shared.enabled", false),
+      rpcHost = rpcEnv.address.host,
+      rpcPort = rpcEnv.address.port)
+
     // shuffleServerId = if (externalShuffleServiceEnabled) {
     //   logInfo(s"external shuffle service port = $externalShuffleServicePort")
     //   BlockManagerId(executorId, blockTransferService.hostName, externalShuffleServicePort)
@@ -214,7 +230,7 @@ private[scache] class BlockManager(
     // }
     shuffleServerId = blockManagerId
 
-    master.registerBlockManager(blockManagerId, maxMemory, slaveEndpoint)
+    master.registerBlockManager(blockManagerId, maxMemory, slaveEndpoint, blockManagerCapability)
 
     // Register Executors' configuration with the local shuffle service, if one should exist.
     // if (externalShuffleServiceEnabled && !blockManagerId.isDriver) {
@@ -277,7 +293,7 @@ private[scache] class BlockManager(
   def reregister(): Unit = {
     // TODO: We might need to rate limit re-registering.
     logInfo(s"BlockManager $blockManagerId re-registering with master")
-    master.registerBlockManager(blockManagerId, maxMemory, slaveEndpoint)
+    master.registerBlockManager(blockManagerId, maxMemory, slaveEndpoint, blockManagerCapability)
     reportAllBlocks()
   }
 
@@ -363,13 +379,28 @@ private[scache] class BlockManager(
   }
 
 
-  def startMapFetch(bmId: BlockManagerId, appName: String, jobId: Int, shuffleId: Int, mapId: Int): Unit = {
+  def startMapFetch(
+      bmId: BlockManagerId,
+      appName: String,
+      jobId: Int,
+      shuffleId: Int,
+      mapId: Int,
+      correlationId: String): BlockManagerMessages.PrefetchResult = {
+    val startedNs = System.nanoTime()
     // only pre-fetch remote bytes
     if (bmId.executorId.equals(executorId)) {
-      return
+      return BlockManagerMessages.PrefetchResult(
+        correlationId, "SKIPPED_LOCAL_SOURCE", bmId, blockManagerId,
+        0, 0, 0, 0, 0L, 0L)
     }
     val shuffleKey = ShuffleKey(appName, jobId, shuffleId)
     val shuffleStatus = mapOutputTracker.getShuffleStatuses(shuffleKey)
+    if (shuffleStatus == null) {
+      return BlockManagerMessages.PrefetchResult(
+        correlationId, "FAILED", bmId, blockManagerId,
+        0, 0, 0, 1, 0L, elapsedMs(startedNs),
+        "ShuffleNotRegistered", shuffleKey.toString)
+    }
     val bIds = new ArrayBuffer[String]()
     for (r <- shuffleStatus.reduceArray) {
       if (r.host.equals(blockManagerId.host)) {
@@ -379,12 +410,17 @@ private[scache] class BlockManager(
     }
     if (bIds.length == 0) {
       logWarning("Got 0 blocks")
-      return
+      return BlockManagerMessages.PrefetchResult(
+        correlationId, "NO_TARGET_BLOCKS", bmId, blockManagerId,
+        0, 0, 0, 0, 0L, elapsedMs(startedNs))
     }
-    logDebug(s"Start to fetch ${appName}_${jobId}_${shuffleId}_${mapId} from ${bmId.host}, " +
-      s"${bIds.length} blocks totally")
-    asyncGetRemoteBlock(bmId, bIds.toArray)
+    logDebug(s"SCACHE_PREFETCH_START correlationId=$correlationId source=$bmId " +
+      s"target=$blockManagerId blocks=${bIds.length}")
+    fetchRemoteBlocksAndWait(bmId, bIds.toArray, correlationId, startedNs)
   }
+
+  private def elapsedMs(startedNs: Long): Long =
+    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)
 
   /**
    * Tell the master about the current storage status of a block. This will send a block update
@@ -652,50 +688,103 @@ private[scache] class BlockManager(
     None
   }
 
-  def asyncGetRemoteBlock(bmId: BlockManagerId, blockIds: Array[String]): Unit = {
+  private def fetchRemoteBlocksAndWait(
+      bmId: BlockManagerId,
+      blockIds: Array[String],
+      correlationId: String,
+      startedNs: Long): BlockManagerMessages.PrefetchResult = {
     if (!networkDataTransferEnabled) {
-      throw new UnsupportedOperationException(
-        s"Remote block fetch is disabled (scache.storage.network.enabled=false): $bmId")
+      return BlockManagerMessages.PrefetchResult(
+        correlationId, "SKIPPED_CAPABILITY_DISABLED", bmId, blockManagerId,
+        blockIds.length, 0, 0, 0, 0L, elapsedMs(startedNs),
+        "RemoteFetchDisabled", "scache.storage.network.enabled=false")
     }
     if (blockIds.length == 0) {
-      logWarning(s"Got an empty block fetch request")
-      return
+      return BlockManagerMessages.PrefetchResult(
+        correlationId, "NO_TARGET_BLOCKS", bmId, blockManagerId,
+        0, 0, 0, 0, 0L, elapsedMs(startedNs))
     }
     if (bmId.executorId.equals(executorId)) {
-      logWarning(s"Got a local block fetch in remote fetch handler")
-      return
+      return BlockManagerMessages.PrefetchResult(
+        correlationId, "SKIPPED_LOCAL_SOURCE", bmId, blockManagerId,
+        blockIds.length, 0, 0, 0, 0L, elapsedMs(startedNs))
     }
-    logDebug(s"Start to fetch remote block from ${bmId.host}")
-    shuffleClient.fetchBlocks(bmId.host, bmId.port, bmId.executorId, blockIds,
-      new BlockFetchingListener {
-        override def onBlockFetchFailure(blockId: String, exception: Throwable): Unit = {
-          logError(s"Fail to fetch block: $blockId from ${bmId.host}")
-//          if (blocksOnTheAir.contains(blockId)) {
-//            val fetchLock = blocksOnTheAir.remove(blockId)
-//            fetchLock.lock.synchronized {
-//              fetchLock.waiting = 0
-//              fetchLock.lock.notifyAll()
-//            }
-//          }
-          throw exception
-        }
+    val latch = new CountDownLatch(blockIds.length)
+    val completed = new AtomicInteger(0)
+    val failed = new AtomicInteger(0)
+    val payloadBytes = new AtomicLong(0L)
+    val errors = new ConcurrentLinkedQueue[Throwable]()
+    try {
+      shuffleClient.fetchBlocks(bmId.host, bmId.port, bmId.executorId, blockIds,
+        new BlockFetchingListener {
+          override def onBlockFetchFailure(blockId: String, exception: Throwable): Unit = {
+            failed.incrementAndGet()
+            errors.add(exception)
+            logError(s"SCACHE_PREFETCH_BLOCK_FAILED correlationId=$correlationId " +
+              s"blockId=$blockId source=$bmId target=$blockManagerId", exception)
+            latch.countDown()
+          }
 
-        override def onBlockFetchSuccess(blockId: String, data: ManagedBuffer): Unit = {
-          val bytes = ByteStreams.toByteArray(data.createInputStream())
-          val buf = ByteBuffer.wrap(bytes)
-          val chunkedBuffer = new ChunkedByteBuffer(Array(buf))
-          putBytes(BlockId.apply(blockId), chunkedBuffer, StorageLevel.MEMORY_ONLY, tellMaster = false)
-          logDebug(s"Got remote block ${blockId} from ${bmId.host} with size ${bytes.length}")
-//          if (blocksOnTheAir.contains(blockId)) {
-//            logDebug(s"Have some requests waiting for ${blockId}, notify them")
-//            val fetchLock = blocksOnTheAir.remove(blockId)
-//            fetchLock.lock.synchronized {
-//              fetchLock.waiting = 0
-//              fetchLock.lock.notifyAll()
-//            }
-//          }
+          override def onBlockFetchSuccess(blockId: String, data: ManagedBuffer): Unit = {
+            try {
+              val bytes = ByteStreams.toByteArray(data.createInputStream())
+              val buf = ByteBuffer.wrap(bytes)
+              val chunkedBuffer = new ChunkedByteBuffer(Array(buf))
+              val stored = putBytes(
+                BlockId.apply(blockId), chunkedBuffer, StorageLevel.MEMORY_ONLY, tellMaster = false)
+              if (!stored) throw new IllegalStateException(s"Failed to store prefetched block $blockId")
+              payloadBytes.addAndGet(bytes.length.toLong)
+              completed.incrementAndGet()
+              logDebug(s"SCACHE_PREFETCH_BLOCK_COMPLETED correlationId=$correlationId " +
+                s"blockId=$blockId bytes=${bytes.length} source=$bmId target=$blockManagerId")
+            } catch {
+              case NonFatal(e) =>
+                failed.incrementAndGet()
+                errors.add(e)
+                logError(s"SCACHE_PREFETCH_BLOCK_FAILED correlationId=$correlationId " +
+                  s"blockId=$blockId source=$bmId target=$blockManagerId", e)
+            } finally {
+              latch.countDown()
+            }
+          }
+        })
+    } catch {
+      case NonFatal(e) =>
+        errors.add(e)
+        while (latch.getCount > 0) {
+          failed.incrementAndGet()
+          latch.countDown()
         }
-      })
+    }
+
+    val timeoutMs = conf.getTimeAsMs("scache.prefetch.timeout", "10s")
+    val finished = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+    val missing = if (finished) 0 else latch.getCount.toInt
+    val firstError = Option(errors.peek())
+    val result = BlockManagerMessages.PrefetchResult(
+      correlationId = correlationId,
+      status = if (finished && failed.get() == 0 && completed.get() == blockIds.length) {
+        "COMPLETED"
+      } else {
+        "FAILED"
+      },
+      sourceBlockManagerId = bmId,
+      targetBlockManagerId = blockManagerId,
+      blockCount = blockIds.length,
+      submitted = blockIds.length,
+      completed = completed.get(),
+      failed = failed.get() + missing,
+      payloadBytes = payloadBytes.get(),
+      elapsedMs = elapsedMs(startedNs),
+      errorType = firstError.map(_.getClass.getName).getOrElse(if (finished) "" else "PrefetchTimeout"),
+      errorMessage = firstError.flatMap(e => Option(e.getMessage)).getOrElse(
+        if (finished) "" else s"Timed out after ${timeoutMs}ms"))
+    logDebug(s"SCACHE_PREFETCH_RESULT correlationId=${result.correlationId} status=${result.status} " +
+      s"source=${result.sourceBlockManagerId} target=${result.targetBlockManagerId} " +
+      s"submitted=${result.submitted} completed=${result.completed} failed=${result.failed} " +
+      s"payloadBytes=${result.payloadBytes} elapsedMs=${result.elapsedMs} " +
+      s"errorType=${result.errorType} errorMessage=${result.errorMessage}")
+    result
   }
 
 //  def addBlockOnTheAir(blockId: BlockId): Boolean = {
@@ -980,6 +1069,16 @@ private[scache] class BlockManager(
         // Now that the block is in either the memory, externalBlockStore, or disk store,
         // tell the master about it.
         info.size = size
+        // Publish only after the normal SCache store succeeded and before master advertisement. The UB
+        // service copies these logical bytes into its separately registered arena; it never
+        // exposes MemoryStore/DiskStore memory directly to a remote peer.
+        blockTransferService match {
+          case ub: org.scache.network.ub.UBBlockTransferService =>
+            ub.publishBlock(blockId, bytes.toArray)
+          case _ =>
+        }
+        // Advertise only after the UB descriptor is published. A strict arena failure therefore
+        // cannot leave the master pointing consumers at a block which UB cannot acquire.
         if (tellMaster) {
           reportBlockStatus(blockId, info, putBlockStatus)
         }
@@ -1534,6 +1633,13 @@ private[scache] class BlockManager(
         // The block has already been removed; do nothing.
         logWarning(s"Asked to remove block $blockId, which does not exist")
       case Some(info) =>
+        // Withdraw the remote descriptor before the underlying SCache bytes can disappear.
+        // This waits for active URMA leases (bounded by the UB configuration) and preserves
+        // the old block when a safe withdrawal cannot be established.
+        blockTransferService match {
+          case ub: org.scache.network.ub.UBBlockTransferService => ub.unpublishBlock(blockId)
+          case _ =>
+        }
         // Removals are idempotent in disk store and memory store. At worst, we get a warning.
         val removedFromMemory = memoryStore.remove(blockId)
         val removedFromDisk = diskStore.remove(blockId)
@@ -1551,6 +1657,11 @@ private[scache] class BlockManager(
   }
 
   def stop(): Unit = {
+    if (blockManagerId != null) {
+      try master.removeExecutor(executorId) catch {
+        case NonFatal(e) => logWarning(s"Failed to deregister BlockManager $blockManagerId", e)
+      }
+    }
     blockTransferService.close()
     if (shuffleClient ne blockTransferService) {
       // Closing should be idempotent, but maybe not for the NioBlockTransferService.

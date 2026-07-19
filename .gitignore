@@ -8,5 +8,10 @@ logs/
 tmp/
 .vscode/
 native/*.so
+native/spark_urma/build/
+native/spark_urma/build_*/
+native/spark_urma/*.so
+native/spark_urma/tests/*.class
 conf/*.orig
 scache-multinode.zip
+hs_err_pid*.log

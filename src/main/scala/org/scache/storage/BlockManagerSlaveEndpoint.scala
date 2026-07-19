@@ -56,9 +56,10 @@ class BlockManagerSlaveEndpoint(
     case GetMatchingBlockIds(filter, _) =>
       context.reply(blockManager.getMatchingBlockIds(filter))
 
-    case StartMapFetch(bmId, appName, jobId, shuffleId, mapId) =>
-      blockManager.startMapFetch(bmId, appName, jobId, shuffleId, mapId)
-      context.reply(true)
+    case StartMapFetch(bmId, appName, jobId, shuffleId, mapId, correlationId) =>
+      doAsync[PrefetchResult](s"prefetch correlationId=$correlationId source=$bmId", context) {
+        blockManager.startMapFetch(bmId, appName, jobId, shuffleId, mapId, correlationId)
+      }
 
 
   }

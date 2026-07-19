@@ -4,6 +4,14 @@ organization := "org.scache"
 
 scalaVersion := "2.13.18"
 
+lazy val Integration = config("integration") extend Test
+configs(Integration)
+inConfig(Integration)(Defaults.testSettings)
+
+Integration / compile / javacOptions ~= (_.filterNot(_.startsWith("-Xplugin:semanticdb")))
+Integration / packageBin / artifactPath :=
+  (Compile / crossTarget).value / s"${name.value}-integration-${version.value}.jar"
+
 // Prefer local Maven cache (helps when working offline / in restricted-network environments).
 resolvers += Resolver.mavenLocal
 
@@ -35,13 +43,13 @@ libraryDependencies ++= Seq(
 )
 
 
-assemblyMergeStrategy in assembly := {
+assembly / assemblyMergeStrategy := {
   case PathList("META-INF", "io.netty.versions.properties") => MergeStrategy.first
   case PathList("org", "apache", xs @ _*) => MergeStrategy.first
   case PathList("com", "esotericsoftware", xs @ _*) => MergeStrategy.first
   case PathList("org", "objenesis", xs @ _*) => MergeStrategy.first
   case PathList("org", "objectweb", xs @ _*) => MergeStrategy.first
   case x =>
-    val oldStrategy = (assemblyMergeStrategy in assembly).value
+    val oldStrategy = (assembly / assemblyMergeStrategy).value
     oldStrategy(x)
 }

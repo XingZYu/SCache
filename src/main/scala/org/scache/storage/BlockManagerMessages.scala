@@ -28,6 +28,21 @@ private[scache] object BlockManagerMessages {
   //////////////////////////////////////////////////////////////////////////////////
   sealed trait ToBlockManagerSlave
 
+  /** Result of a capability-aware map prefetch request. */
+  case class PrefetchResult(
+      correlationId: String,
+      status: String,
+      sourceBlockManagerId: BlockManagerId,
+      targetBlockManagerId: BlockManagerId,
+      blockCount: Int,
+      submitted: Int,
+      completed: Int,
+      failed: Int,
+      payloadBytes: Long,
+      elapsedMs: Long,
+      errorType: String = "",
+      errorMessage: String = "") extends Serializable
+
   // Remove a block from the slaves that have it. This can only be used to remove
   // blocks that the master knows about.
   case class RemoveBlock(blockId: BlockId) extends ToBlockManagerSlave
@@ -42,7 +57,13 @@ private[scache] object BlockManagerMessages {
   case class RemoveBroadcast(broadcastId: Long, removeFromDriver: Boolean = true)
     extends ToBlockManagerSlave
 
-  case class StartMapFetch(blockManagerId: BlockManagerId, appName: String, jobId: Int, shuffleId: Int, mapId: Int) extends ToBlockManagerSlave
+  case class StartMapFetch(
+      blockManagerId: BlockManagerId,
+      appName: String,
+      jobId: Int,
+      shuffleId: Int,
+      mapId: Int,
+      correlationId: String) extends ToBlockManagerSlave
 
   /**
    * Driver -> Executor message to trigger a thread dump.
@@ -54,11 +75,29 @@ private[scache] object BlockManagerMessages {
   //////////////////////////////////////////////////////////////////////////////////
   sealed trait ToBlockManagerMaster
 
+  /** Versioned data-node identity and remote-fetch capability. */
+  case class BlockManagerCapability(
+      protocolVersion: Int,
+      nodeEpoch: String,
+      clientId: String,
+      blockManagerId: BlockManagerId,
+      backend: String,
+      networkEnabled: Boolean,
+      remoteFetchSupported: Boolean,
+      sharedCxlEnabled: Boolean,
+      rpcHost: String,
+      rpcPort: Int) extends Serializable
+
   case class RegisterBlockManager(
       blockManagerId: BlockManagerId,
       maxMemSize: Long,
-      sender: RpcEndpointRef)
+      sender: RpcEndpointRef,
+      capability: BlockManagerCapability)
     extends ToBlockManagerMaster
+
+  case object GetBlockManagerCapabilities extends ToBlockManagerMaster
+
+  case object GetPrefetchResults extends ToBlockManagerMaster
 
   case class UpdateBlockInfo(
       var blockManagerId: BlockManagerId,
@@ -130,6 +169,17 @@ private[scache] object BlockManagerMessages {
    */
   case class AllocateCxlBlock(domainId: String, length: Int) extends ToBlockManagerMaster
 
+  /** Batch-allocate multiple slices in a single synchronized call. */
+  case class AllocateCxlBlocks(domainId: String, lengths: Seq[Int]) extends ToBlockManagerMaster
+
+  /** Allocate and track a not-yet-committed slice so cancellation can reclaim it. */
+  case class ReserveCxlBlock(
+      blockId: BlockId, domainId: String, length: Int) extends ToBlockManagerMaster
+
+  /** Batch form of [[ReserveCxlBlock]]. */
+  case class ReserveCxlBlocks(
+      blockIds: Seq[BlockId], domainId: String, lengths: Seq[Int]) extends ToBlockManagerMaster
+
   /** Register a committed block as residing in the shared CXL pool. */
   case class RegisterCxlBlock(blockId: BlockId, location: CxlBlockLocation) extends ToBlockManagerMaster
 
@@ -138,6 +188,12 @@ private[scache] object BlockManagerMessages {
 
   /** Remove a block's shared CXL pool metadata and free the slice (best effort). */
   case class ReleaseCxlBlock(blockId: BlockId) extends ToBlockManagerMaster
+
+  /** Release all shared-CXL blocks for one application shuffle. */
+  case class ReleaseCxlAppShuffle(appName: String, shuffleId: Int) extends ToBlockManagerMaster
+
+  /** Release all shared-CXL blocks for one application, including late registrations. */
+  case class ReleaseCxlApplication(appName: String) extends ToBlockManagerMaster
 
   /** Register a CXL memory domain with its pool configuration and member hosts. */
   case class RegisterCxlDomain(domainId: String, poolPath: String,

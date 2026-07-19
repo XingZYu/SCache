@@ -18,6 +18,7 @@
 package org.scache.network.netty
 
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicLong
 
 import org.scache.network.protocol.UploadBlock
 
@@ -52,9 +53,11 @@ private[scache] class NettyBlockTransferService(
   private[this] var server: TransportServer = _
   private[this] var clientFactory: TransportClientFactory = _
   private[this] var appId: String = _
+  private[this] val transportMetrics = new NettyBlockTransferMetrics
 
   override def init(blockDataManager: BlockDataManager): Unit = {
-    val rpcHandler = new NettyBlockRpcServer(conf.getAppId, serializer, blockDataManager)
+    val rpcHandler = new NettyBlockRpcServer(
+      conf.getAppId, serializer, blockDataManager, Some(transportMetrics))
     var serverBootstrap: Option[TransportServerBootstrap] = None
     var clientBootstrap: Option[TransportClientBootstrap] = None
     // if (authEnabled) {
@@ -87,6 +90,18 @@ private[scache] class NettyBlockTransferService(
       blockIds: Array[String],
       listener: BlockFetchingListener): Unit = {
     logTrace(s"Fetch blocks from $host:$port (executor id $execId)")
+    transportMetrics.recordFetchRequest(blockIds.length)
+    val metricsListener = new BlockFetchingListener {
+      override def onBlockFetchFailure(blockId: String, exception: Throwable): Unit = {
+        transportMetrics.recordFetchFailure()
+        listener.onBlockFetchFailure(blockId, exception)
+      }
+
+      override def onBlockFetchSuccess(blockId: String, data: ManagedBuffer): Unit = {
+        transportMetrics.recordFetchSuccess(data.size)
+        listener.onBlockFetchSuccess(blockId, data)
+      }
+    }
     try {
       val blockFetchStarter = new RetryingBlockFetcher.BlockFetchStarter {
         override def createAndStart(blockIds: Array[String], listener: BlockFetchingListener) {
@@ -99,9 +114,9 @@ private[scache] class NettyBlockTransferService(
       if (maxRetries > 0) {
         // Note this Fetcher will correctly handle maxRetries == 0; we avoid it just in case there's
         // a bug in this code. We should remove the if statement once we're sure of the stability.
-        new RetryingBlockFetcher(transportConf, blockFetchStarter, blockIds, listener).start()
+        new RetryingBlockFetcher(transportConf, blockFetchStarter, blockIds, metricsListener).start()
       } else {
-        blockFetchStarter.createAndStart(blockIds, listener)
+        blockFetchStarter.createAndStart(blockIds, metricsListener)
       }
     } catch {
       case e: Exception =>
@@ -111,6 +126,8 @@ private[scache] class NettyBlockTransferService(
   }
 
   override def port: Int = server.getPort
+
+  private[scache] def metricsSnapshot: Map[String, Long] = transportMetrics.snapshot
 
   override def uploadBlock(
       hostname: String,
@@ -153,4 +170,44 @@ private[scache] class NettyBlockTransferService(
       clientFactory.close()
     }
   }
+}
+
+/** Minimal data-path counters used by the phase-1 Netty baseline and future regressions. */
+private[scache] final class NettyBlockTransferMetrics {
+  private[this] val fetchRequests = new AtomicLong(0L)
+  private[this] val fetchBlocks = new AtomicLong(0L)
+  private[this] val fetchSuccesses = new AtomicLong(0L)
+  private[this] val fetchFailures = new AtomicLong(0L)
+  private[this] val fetchedPayloadBytes = new AtomicLong(0L)
+  private[this] val serverOpenRequests = new AtomicLong(0L)
+  private[this] val serverOpenedBlocks = new AtomicLong(0L)
+  private[this] val serverPayloadBytes = new AtomicLong(0L)
+
+  def recordFetchRequest(blockCount: Int): Unit = {
+    fetchRequests.incrementAndGet()
+    fetchBlocks.addAndGet(blockCount.toLong)
+  }
+
+  def recordFetchSuccess(bytes: Long): Unit = {
+    fetchSuccesses.incrementAndGet()
+    fetchedPayloadBytes.addAndGet(bytes)
+  }
+
+  def recordFetchFailure(): Unit = fetchFailures.incrementAndGet()
+
+  def recordServerOpen(blockCount: Int, bytes: Long): Unit = {
+    serverOpenRequests.incrementAndGet()
+    serverOpenedBlocks.addAndGet(blockCount.toLong)
+    serverPayloadBytes.addAndGet(bytes)
+  }
+
+  def snapshot: Map[String, Long] = Map(
+    "netty.fetchRequests" -> fetchRequests.get(),
+    "netty.fetchBlocks" -> fetchBlocks.get(),
+    "netty.fetchSuccesses" -> fetchSuccesses.get(),
+    "netty.fetchFailures" -> fetchFailures.get(),
+    "netty.fetchedPayloadBytes" -> fetchedPayloadBytes.get(),
+    "netty.serverOpenRequests" -> serverOpenRequests.get(),
+    "netty.serverOpenedBlocks" -> serverOpenedBlocks.get(),
+    "netty.serverPayloadBytes" -> serverPayloadBytes.get())
 }

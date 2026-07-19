@@ -49,10 +49,21 @@ class BlockManagerMaster(
 
   /** Register the BlockManager's id with the driver. */
   def registerBlockManager(
-      blockManagerId: BlockManagerId, maxMemSize: Long, slaveEndpoint: RpcEndpointRef): Unit = {
+      blockManagerId: BlockManagerId,
+      maxMemSize: Long,
+      slaveEndpoint: RpcEndpointRef,
+      capability: BlockManagerCapability): Unit = {
     logInfo(s"Registering BlockManager $blockManagerId")
-    tell(RegisterBlockManager(blockManagerId, maxMemSize, slaveEndpoint))
+    tell(RegisterBlockManager(blockManagerId, maxMemSize, slaveEndpoint, capability))
     logInfo(s"Registered BlockManager $blockManagerId")
+  }
+
+  def getBlockManagerCapabilities: Seq[BlockManagerCapability] = {
+    driverEndpoint.askWithRetry[Seq[BlockManagerCapability]](GetBlockManagerCapabilities)
+  }
+
+  def getPrefetchResults: Seq[PrefetchResult] = {
+    driverEndpoint.askWithRetry[Seq[PrefetchResult]](GetPrefetchResults)
   }
 
   def updateBlockInfo(
@@ -226,6 +237,22 @@ class BlockManagerMaster(
     driverEndpoint.askWithRetry[Option[CxlBlockLocation]](AllocateCxlBlock(domainId, length))
   }
 
+  def allocateCxlBlocks(domainId: String, lengths: Seq[Int]): Seq[Option[CxlBlockLocation]] = {
+    driverEndpoint.askWithRetry[Seq[Option[CxlBlockLocation]]](AllocateCxlBlocks(domainId, lengths))
+  }
+
+  def reserveCxlBlock(
+      blockId: BlockId, domainId: String, length: Int): Option[CxlBlockLocation] = {
+    driverEndpoint.askWithRetry[Option[CxlBlockLocation]](
+      ReserveCxlBlock(blockId, domainId, length))
+  }
+
+  def reserveCxlBlocks(
+      blockIds: Seq[BlockId], domainId: String, lengths: Seq[Int]): Seq[Option[CxlBlockLocation]] = {
+    driverEndpoint.askWithRetry[Seq[Option[CxlBlockLocation]]](
+      ReserveCxlBlocks(blockIds, domainId, lengths))
+  }
+
   def registerCxlBlock(blockId: BlockId, location: CxlBlockLocation): Boolean = {
     driverEndpoint.askWithRetry[Boolean](RegisterCxlBlock(blockId, location))
   }
@@ -236,6 +263,14 @@ class BlockManagerMaster(
 
   def releaseCxlBlock(blockId: BlockId): Boolean = {
     driverEndpoint.askWithRetry[Boolean](ReleaseCxlBlock(blockId))
+  }
+
+  def releaseCxlAppShuffle(appName: String, shuffleId: Int): Int = {
+    driverEndpoint.askWithRetry[Int](ReleaseCxlAppShuffle(appName, shuffleId))
+  }
+
+  def releaseCxlApplication(appName: String): Int = {
+    driverEndpoint.askWithRetry[Int](ReleaseCxlApplication(appName))
   }
 
   def registerCxlDomain(domainId: String, poolPath: String, poolSize: Long,
