@@ -23,21 +23,22 @@
 
 struct urma_context;
 struct urma_jetty;
+struct urma_jfs;
 struct urma_jfc;
 struct urma_jfr;
 struct urma_target_seg;
 struct urma_target_jetty;
+struct urma_token_id;
 typedef struct urma_context   urma_context_t;
 typedef struct urma_jetty     urma_jetty_t;
+typedef struct urma_jfs       urma_jfs_t;
 typedef struct urma_jfc       urma_jfc_t;
 typedef struct urma_jfr       urma_jfr_t;
 typedef struct urma_target_seg urma_target_seg_t;
 typedef struct urma_target_jetty urma_target_jetty_t;
+typedef struct urma_token_id urma_token_id_t;
 
 namespace spark_urma {
-
-// 单次请求的最大安全字节数（Tier S 限制）
-static constexpr size_t MAX_SINGLE_REQUEST_BYTES = 4096;
 
 enum class TransportState { NEW, INITIALIZED, CONNECTED, RUNNING, CLOSING, CLOSED };
 
@@ -64,8 +65,11 @@ public:
     RegisteredRegion register_region(void* address, size_t length);
     void unregister_region(uint64_t handle);
     RegisteredRegion registered_region(uint64_t handle) const;
+    // Drop cached peer MR imports after an application has released all blocks.
+    // This is safe only after provider requests have drained.
+    void release_cached_remote_imports();
 
-    // ---- 裸数据操作：严格限制 <= 4096B ----
+    // ---- Raw operations, bounded by queried local/peer provider capabilities ----
     uint64_t write(const RemoteRegion& remote, const void* source,
                    size_t length, size_t remote_offset = 0);
     uint64_t read(const RemoteRegion& remote, void* destination,
@@ -104,6 +108,7 @@ private:
     // URMA handles
     urma_context_t* ctx_ = nullptr;
     urma_jetty_t* jetty_ = nullptr;
+    urma_jfs_t* jfs_ = nullptr;
     urma_jfc_t* jfc_ = nullptr;
     urma_jfr_t* jfr_ = nullptr;
     urma_target_seg_t* local_seg_ = nullptr;
@@ -120,12 +125,16 @@ private:
 
     TransportOptions options_;
     TransportState state_ = TransportState::NEW;
+    uint32_t provider_max_raw_operation_bytes_ = 0;
+    uint32_t local_max_raw_operation_bytes_ = 0;
+    uint32_t effective_max_raw_operation_bytes_ = 0;
     EndpointDescriptor local_ep_;
     EndpointDescriptor remote_ep_;
 
     struct LocalRegionState {
         RegisteredRegion region;
         urma_target_seg_t* segment = nullptr;
+        urma_token_id_t* token_id = nullptr;
         uint64_t inflight = 0;
         bool registered = true;
     };
@@ -136,6 +145,14 @@ private:
         uint64_t request_id;
         bool is_write = false, is_read = false, is_send = false;
         bool is_aggregate = false;
+        // Logical-block children are posted outside the owner lock.  Keep
+        // aggregate refresh from finalizing a partial child list.
+        bool aggregate_building = false;
+        // Keep a terminal child addressable until its logical-block
+        // aggregate reaches a terminal state.  Without this ownership link,
+        // the bounded terminal cache can evict a completed child while a
+        // large Spark shuffle block is still being drained.
+        uint64_t aggregate_parent = 0;
         size_t bytes = 0;
         size_t completed_bytes = 0;
         RequestState state = RequestState::CREATED;

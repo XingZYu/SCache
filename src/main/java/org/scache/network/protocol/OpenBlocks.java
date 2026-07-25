@@ -46,11 +46,8 @@ public class OpenBlocks extends BlockTransferMessage {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("appId", appId)
-      .add("execId", execId)
-      .add("blockIds", Arrays.toString(blockIds))
-      .toString();
+    return getClass().getSimpleName() + "{appId=" + appId + ", execId=" + execId
+      + ", blockIds=" + Arrays.toString(blockIds) + "}";
   }
 
   @Override

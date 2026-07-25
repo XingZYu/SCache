@@ -19,7 +19,7 @@ struct TransportOptions {
     uint32_t queue_depth = 128;
     uint32_t poll_batch = 32;
     uint32_t request_timeout_ms = 30000;
-    uint32_t max_chunk_bytes = 4096;  // Tier S safe limit
+    uint32_t max_chunk_bytes = 10U * 1024U * 1024U;  // configured maximum
     bool strict_mode = true;
 };
 
@@ -30,6 +30,10 @@ struct RegisteredRegion {
     size_t length = 0;
     uint64_t remote_address = 0;
     uint64_t token = 0;
+    // Provider-specific memory-registration generation.  Native-vdev Q8 uses
+    // this value as the NOMAP import cookie; generic UMDK backends may leave it
+    // zero and use the normal public import argument semantics.
+    uint64_t generation = 0;
     uint64_t owner_epoch = 0;
 };
 
@@ -38,6 +42,7 @@ struct RemoteRegion {
     uint64_t remote_address = 0;
     uint64_t length = 0;
     uint64_t token = 0;
+    uint64_t generation = 0;
 };
 
 // ---- Completion result ----
@@ -72,12 +77,19 @@ struct EndpointDescriptor {
     uint32_t protocol_version = 1;
     uint32_t uasid = 0;
     uint32_t jetty_id = 0;
+    uint32_t reserved0 = 0;  // binary-layout padding before the 16-byte EID
     uint8_t eid[16] = {};
     uint64_t segment_address = 0;
     uint64_t segment_length = 0;
     uint32_t segment_token = 0;
-    uint32_t max_chunk_bytes = 4096;
+    uint32_t max_chunk_bytes = 10U * 1024U * 1024U;
     uint32_t transport_mode = 0;    // URMA_TM_RC
+    // Provider segment EID index; the jetty uasid above remains the value
+    // required for urma_import_jetty. Serialized in the former final pad.
+    uint32_t segment_uasid = 0;
+    // Provider MR generation (Q8 NOMAP import cookie), appended after the
+    // original 64-byte descriptor for protocol-compatible extension.
+    uint64_t segment_generation = 0;
 
     // Serialize to/from network byte order
     void to_network();

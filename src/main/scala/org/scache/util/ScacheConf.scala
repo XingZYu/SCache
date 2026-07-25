@@ -34,7 +34,7 @@ class ScacheConf(var home: String) extends Logging {
             case ConfigValueType.STRING =>
               settings.put(e.getKey, config.getString(e.getKey))
             case ConfigValueType.NUMBER =>
-              settings.put(e.getKey, config.getInt(e.getKey).toString)
+              settings.put(e.getKey, e.getValue.unwrapped().toString)
             case _ =>
           }
 

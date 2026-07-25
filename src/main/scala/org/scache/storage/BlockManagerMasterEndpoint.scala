@@ -30,6 +30,7 @@ import scala.collection.mutable
 import scala.collection.JavaConverters._
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future}
 import scala.util.control.NonFatal
+import scala.util.{Failure, Success}
 import org.scache.util.{ScacheConf, Logging, Utils, ThreadUtils}
 import org.scache.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, ThreadSafeRpcEndpoint}
 import org.scache.storage.BlockManagerMessages._
@@ -188,8 +189,8 @@ class BlockManagerMasterEndpoint(
     case ReleaseCxlBlock(blockId) =>
       context.reply(releaseCxlBlock(blockId))
 
-    case ReleaseCxlAppShuffle(appName, shuffleId) =>
-      context.reply(releaseCxlBlocksForAppShuffle(appName, shuffleId))
+    case ReleaseCxlAppShuffle(appName, shuffleId, jobId) =>
+      context.reply(releaseCxlBlocksForAppShuffle(appName, shuffleId, jobId))
 
     case ReleaseCxlApplication(appName) =>
       context.reply(releaseCxlBlocksForApplication(appName))
@@ -204,13 +205,31 @@ class BlockManagerMasterEndpoint(
       context.reply(getCxlPoolStats(domainId))
 
     case RemoveRdd(rddId) =>
-      context.reply(removeRdd(rddId))
+      removeRdd(rddId).onComplete {
+        case Success(result) => context.reply(result)
+        case Failure(error) => context.sendFailure(error)
+      }(askExecutionContext)
 
-    case RemoveShuffle(shuffleId) =>
-      context.reply(removeShuffle(shuffleId))
+    case RemoveShuffle(shuffleId, appName, jobId) =>
+      // Fan-out asks include the requesting client itself.  Complete the
+      // outer RPC asynchronously so that the endpoint dispatcher remains
+      // available to process that client's RemoveShuffle message.
+      removeShuffle(shuffleId, appName, jobId).onComplete {
+        case Success(result) => context.reply(result)
+        case Failure(error) => context.sendFailure(error)
+      }(askExecutionContext)
+
+    case RemoveApplication(appName) =>
+      removeApplication(appName).onComplete {
+        case Success(result) => context.reply(result)
+        case Failure(error) => context.sendFailure(error)
+      }(askExecutionContext)
 
     case RemoveBroadcast(broadcastId, removeFromDriver) =>
-      context.reply(removeBroadcast(broadcastId, removeFromDriver))
+      removeBroadcast(broadcastId, removeFromDriver).onComplete {
+        case Success(result) => context.reply(result)
+        case Failure(error) => context.sendFailure(error)
+      }(askExecutionContext)
 
     case RemoveBlock(blockId) =>
       releaseCxlBlock(blockId)
@@ -438,12 +457,29 @@ class BlockManagerMasterEndpoint(
     )
   }
 
-  private def removeShuffle(shuffleId: Int): Future[Seq[Boolean]] = {
-    releaseCxlBlocksForShuffle(shuffleId)
-    val removeMsg = RemoveShuffle(shuffleId)
+  private def removeShuffle(
+      shuffleId: Int,
+      appName: String,
+      jobId: Int): Future[Seq[Int]] = {
+    if (appName == null || appName.isEmpty) {
+      releaseCxlBlocksForShuffle(shuffleId)
+    } else {
+      releaseCxlBlocksForAppShuffle(appName, shuffleId, jobId)
+    }
+    val removeMsg = RemoveShuffle(shuffleId, Option(appName).getOrElse(""), jobId)
     Future.sequence(
       blockManagerInfo.values.map { bm =>
-        bm.slaveEndpoint.ask[Boolean](removeMsg)
+        bm.slaveEndpoint.ask[Int](removeMsg)
+      }.toSeq
+    )
+  }
+
+  private def removeApplication(appName: String): Future[Seq[Int]] = {
+    releaseCxlBlocksForApplication(appName)
+    val removeMsg = RemoveApplication(appName)
+    Future.sequence(
+      blockManagerInfo.values.map { bm =>
+        bm.slaveEndpoint.ask[Int](removeMsg)
       }.toSeq
     )
   }
@@ -464,16 +500,21 @@ class BlockManagerMasterEndpoint(
     removedLocations.foreach(freeCxlLocation)
   }
 
-  private def releaseCxlBlocksForAppShuffle(appName: String, shuffleId: Int): Int = {
+  private def releaseCxlBlocksForAppShuffle(
+      appName: String,
+      shuffleId: Int,
+      jobId: Int = -1): Int = {
     if (!cxlSharedEnabled || appName == null || appName.isEmpty) return 0
     val removedLocations = cxlStateLock.synchronized {
       val committed = cxlBlocks.collect {
         case (bid: ScacheBlockId, loc)
-            if bid.app == appName && bid.shuffleId == shuffleId => (bid, loc)
+            if bid.app == appName && bid.shuffleId == shuffleId &&
+              (jobId < 0 || bid.jobId == jobId) => (bid, loc)
       }.toArray
       val reserved = cxlReservations.collect {
         case (bid: ScacheBlockId, loc)
-            if bid.app == appName && bid.shuffleId == shuffleId => (bid, loc)
+            if bid.app == appName && bid.shuffleId == shuffleId &&
+              (jobId < 0 || bid.jobId == jobId) => (bid, loc)
       }.toArray
       committed.foreach { case (bid, _) => cxlBlocks.remove(bid) }
       reserved.foreach { case (bid, _) => cxlReservations.remove(bid) }
@@ -845,11 +886,15 @@ private[storage] final class CxlPoolAllocator(
 
   private val free = new JTreeMap[java.lang.Long, java.lang.Long]()
   private var nextOffset = 0L
+  // Before the first wrap, [nextOffset, poolSizeBytes) is virgin space and is not
+  // represented in `free`. After wrap, the whole pool is represented by `free`;
+  // counting the tail again would make freeBytes exceed poolSizeBytes.
+  private var wrapped = false
   private var _allocationCount: Long = 0L
 
   def allocationCount: Long = _allocationCount
   def freeBytes: Long = synchronized {
-    poolSizeBytes - (if (nextOffset > 0) nextOffset else 0L) +
+    (if (wrapped) 0L else poolSizeBytes - nextOffset) +
       free.values().asScala.foldLeft(0L)((sum, len) => sum + len)
   }
   def freeSegmentCount: Int = synchronized { free.size() }
@@ -905,6 +950,7 @@ private[storage] final class CxlPoolAllocator(
       insertFree(originalNext, poolSizeBytes - originalNext)
     }
     nextOffset = 0L
+    wrapped = true
     allocateFromFree(size)
   }
 

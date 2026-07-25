@@ -28,8 +28,9 @@ public final class UrmaTransport implements AutoCloseable {
      *
      * @param deviceName   URMA device name (e.g. "openurma0")
      * @param queueDepth   Completion queue depth
-     * @param maxChunkBytes Maximum bytes per single URMA operation (default 4096 for Tier S)
-     * @param strict       If true, reject payloads > maxChunkBytes (use chunked ops instead)
+     * @param maxChunkBytes Configured maximum bytes per raw URMA operation. The
+     *                      native transport clamps this to the queried provider capability.
+     * @param strict       If true, reject unsupported capabilities instead of falling back
      */
     public static UrmaTransport open(String deviceName, int queueDepth,
                                       int maxChunkBytes, boolean strict)
@@ -57,9 +58,6 @@ public final class UrmaTransport implements AutoCloseable {
         if (maxChunkBytes <= 0) {
             throw new UrmaInitializationException("maxChunkBytes must be > 0, got " + maxChunkBytes);
         }
-        if (maxChunkBytes > 4096) {
-            throw new UrmaInitializationException("Tier S maxChunkBytes must be <= 4096");
-        }
         if (wireRole == null || (!wireRole.equals("listen") && !wireRole.equals("connect"))) {
             throw new UrmaInitializationException("wireRole must be listen or connect");
         }
@@ -71,9 +69,11 @@ public final class UrmaTransport implements AutoCloseable {
 
         UrmaTransport t = new UrmaTransport();
         t.deviceName = deviceName;
-        t.maxChunkBytes = maxChunkBytes;
         t.ownerEpoch = System.nanoTime();
         t.nativeHandle = UrmaNative.nativeInit(deviceName, queueDepth, maxChunkBytes, strict, wireRole);
+        EndpointDescriptor local = EndpointDescriptor.fromBytes(
+            UrmaNative.nativeGetLocalEndpoint(t.nativeHandle));
+        t.maxChunkBytes = local.maxChunkBytes;
         return t;
     }
 
@@ -83,7 +83,10 @@ public final class UrmaTransport implements AutoCloseable {
         if (remote == null) throw new UrmaConnectionException("remote endpoint must not be null");
         remote.validate();
         UrmaNative.nativeConnect(nativeHandle, remote.eid, remote.uasid, remote.jettyId,
+                                  remote.maxChunkBytes, remote.segmentUasid,
+                                  remote.segmentGeneration,
                                   remote.segmentAddress, remote.segmentLength, remote.segmentToken);
+        maxChunkBytes = Math.min(maxChunkBytes, remote.maxChunkBytes);
     }
 
     /** Get this transport's local endpoint for exchange via control channel. */
@@ -103,11 +106,11 @@ public final class UrmaTransport implements AutoCloseable {
         checkNotClosed();
         checkDirect(buffer);
         long[] descriptor = UrmaNative.nativeRegisterBuffer(nativeHandle, buffer);
-        if (descriptor == null || descriptor.length != 4) {
+        if (descriptor == null || descriptor.length != 5) {
             throw new UrmaException("native registration returned an invalid descriptor");
         }
         return new RegisteredBuffer(this, descriptor[0], buffer,
-                                    descriptor[1], descriptor[2], descriptor[3]);
+                                    descriptor[1], descriptor[2], descriptor[3], descriptor[4]);
     }
 
     public void unregisterBuffer(RegisteredBuffer buffer) {
@@ -117,6 +120,15 @@ public final class UrmaTransport implements AutoCloseable {
         if (!buffer.registered) throw new UrmaException("buffer is already unregistered");
         UrmaNative.nativeUnregisterBuffer(nativeHandle, buffer.handle);
         buffer.registered = false;
+    }
+
+    /**
+     * Release cached peer MR imports once application-level reads have drained.
+     * The transport remains connected and may import descriptors again later.
+     */
+    public void releaseCachedRemoteImports() {
+        checkNotClosed();
+        UrmaNative.nativeReleaseCachedRemoteImports(nativeHandle);
     }
 
     // ---- Write ----
@@ -133,7 +145,7 @@ public final class UrmaTransport implements AutoCloseable {
 
         if (closed) throw new UrmaException("Transport closed");
         return UrmaNative.nativeWrite(nativeHandle,
-            remote.remoteAddress, remote.length, remote.token,
+            remote.remoteAddress, remote.length, remote.token, remote.generation,
             source, offset, length);
     }
 
@@ -150,7 +162,7 @@ public final class UrmaTransport implements AutoCloseable {
         checkBounds(dest, offset, length);
 
         return UrmaNative.nativeRead(nativeHandle,
-            remote.remoteAddress, remote.length, remote.token,
+            remote.remoteAddress, remote.length, remote.token, remote.generation,
             dest, offset, length);
     }
 
@@ -171,7 +183,7 @@ public final class UrmaTransport implements AutoCloseable {
     // ---- Chunked operations ----
 
     /**
-     * Write a large block split into <= maxChunkBytes chunks.
+     * Write a large block split using the negotiated provider capability.
      */
     public long writeChunked(RemoteBuffer remote, ByteBuffer source, int offset, int totalLength) {
         checkNotClosed();
@@ -180,7 +192,7 @@ public final class UrmaTransport implements AutoCloseable {
         checkBounds(source, offset, totalLength);
 
         return UrmaNative.nativeWriteChunked(nativeHandle,
-            remote.remoteAddress, remote.length, remote.token,
+            remote.remoteAddress, remote.length, remote.token, remote.generation,
             source, offset, totalLength);
     }
 
@@ -194,7 +206,7 @@ public final class UrmaTransport implements AutoCloseable {
         checkBounds(dest, offset, totalLength);
 
         return UrmaNative.nativeReadChunked(nativeHandle,
-            remote.remoteAddress, remote.length, remote.token,
+            remote.remoteAddress, remote.length, remote.token, remote.generation,
             dest, offset, totalLength);
     }
 
@@ -299,15 +311,17 @@ public final class UrmaTransport implements AutoCloseable {
         public final long remoteAddress;
         public final long length;
         public final long token;
+        public final long generation;
         private volatile boolean registered = true;
         RegisteredBuffer(UrmaTransport owner, long handle, ByteBuffer buffer,
-                         long remoteAddress, long length, long token) {
+                         long remoteAddress, long length, long token, long generation) {
             this.owner = owner;
             this.handle = handle;
             this.buffer = buffer;
             this.remoteAddress = remoteAddress;
             this.length = length;
             this.token = token;
+            this.generation = generation;
         }
         void checkOwner(UrmaTransport candidate) {
             if (owner != candidate) throw new UrmaException("registered buffer belongs to another transport");
@@ -315,7 +329,7 @@ public final class UrmaTransport implements AutoCloseable {
         public boolean isRegistered() { return registered; }
         public RemoteBuffer descriptor() {
             if (!registered) throw new UrmaException("buffer is unregistered");
-            return new RemoteBuffer(remoteAddress, length, (int) token);
+            return new RemoteBuffer(remoteAddress, length, (int) token, generation);
         }
     }
 }

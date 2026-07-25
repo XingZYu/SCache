@@ -67,9 +67,6 @@ public class NioManagedBuffer extends ManagedBuffer {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("buf", buf)
-      .toString();
+    return getClass().getSimpleName() + "{buf=" + buf + "}";
   }
 }
-

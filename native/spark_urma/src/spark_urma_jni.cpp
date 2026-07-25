@@ -103,7 +103,7 @@ Java_org_scache_network_ub_UrmaNative_nativeInit(
     (void)clazz;
     try {
         if (deviceName == nullptr || wireRole == nullptr || queueDepth <= 0 ||
-            maxChunkBytes <= 0 || maxChunkBytes > static_cast<jint>(MAX_SINGLE_REQUEST_BYTES)) {
+            maxChunkBytes <= 0) {
             throw std::runtime_error("invalid nativeInit arguments");
         }
         const char* dev = env->GetStringUTFChars(deviceName, nullptr);
@@ -133,7 +133,8 @@ Java_org_scache_network_ub_UrmaNative_nativeInit(
 JNIEXPORT void JNICALL
 Java_org_scache_network_ub_UrmaNative_nativeConnect(
     JNIEnv* env, jclass clazz, jlong handle,
-    jbyteArray eid, jint uasid, jint jettyId,
+    jbyteArray eid, jint uasid, jint jettyId, jint remoteMaxChunkBytes,
+    jint segmentUasid, jlong segmentGeneration,
     jlong segAddr, jlong segLen, jint segToken)
 {
     (void)clazz;
@@ -145,10 +146,14 @@ Java_org_scache_network_ub_UrmaNative_nativeConnect(
         remote.jetty_id = static_cast<uint32_t>(jettyId);
         remote.segment_address = static_cast<uint64_t>(segAddr);
         remote.segment_length = static_cast<uint64_t>(segLen);
+        remote.segment_uasid = static_cast<uint32_t>(segmentUasid);
         remote.segment_token = static_cast<uint32_t>(segToken);
+        remote.segment_generation = static_cast<uint64_t>(segmentGeneration);
 
-        if (eid == nullptr || env->GetArrayLength(eid) != 16 || segAddr < 0 || segLen < 0)
+        if (eid == nullptr || env->GetArrayLength(eid) != 16 ||
+            remoteMaxChunkBytes <= 0 || segAddr < 0 || segLen < 0)
             throw std::runtime_error("endpoint EID must be exactly 16 bytes and segment values non-negative");
+        remote.max_chunk_bytes = static_cast<uint32_t>(remoteMaxChunkBytes);
         env->GetByteArrayRegion(eid, 0, 16, reinterpret_cast<jbyte*>(remote.eid));
         if (env->ExceptionCheck()) return;
 
@@ -198,7 +203,8 @@ Java_org_scache_network_ub_UrmaNative_nativeClose(
     }
 }
 
-// UrmaNative.nativeRegisterBuffer(long handle, ByteBuffer directBuffer) -> long regionHandle
+// UrmaNative.nativeRegisterBuffer(long handle, ByteBuffer directBuffer) ->
+// [handle, remoteAddress, length, token, providerGeneration]
 JNIEXPORT jlongArray JNICALL
 Java_org_scache_network_ub_UrmaNative_nativeRegisterBuffer(
     JNIEnv* env, jclass clazz, jlong handle, jobject buffer)
@@ -214,12 +220,13 @@ Java_org_scache_network_ub_UrmaNative_nativeRegisterBuffer(
         if (!addr || cap <= 0) throw std::runtime_error("must use non-empty ByteBuffer.allocateDirect()");
 
         auto region = transport->register_region(addr, static_cast<size_t>(cap));
-        jlong values[4] = {static_cast<jlong>(region.handle),
+        jlong values[5] = {static_cast<jlong>(region.handle),
                            static_cast<jlong>(region.remote_address),
                            static_cast<jlong>(region.length),
-                           static_cast<jlong>(region.token)};
-        jlongArray result = env->NewLongArray(4);
-        if (result != nullptr) env->SetLongArrayRegion(result, 0, 4, values);
+                           static_cast<jlong>(region.token),
+                           static_cast<jlong>(region.generation)};
+        jlongArray result = env->NewLongArray(5);
+        if (result != nullptr) env->SetLongArrayRegion(result, 0, 5, values);
         return result;
     } catch (const std::exception& e) {
         THROW_URMA(env, e.what());
@@ -241,12 +248,27 @@ Java_org_scache_network_ub_UrmaNative_nativeUnregisterBuffer(
     }
 }
 
+// UrmaNative.nativeReleaseCachedRemoteImports(long handle)
+JNIEXPORT void JNICALL
+Java_org_scache_network_ub_UrmaNative_nativeReleaseCachedRemoteImports(
+    JNIEnv* env, jclass clazz, jlong handle)
+{
+    (void)clazz;
+    try {
+        auto* transport = get_transport(handle);
+        transport->release_cached_remote_imports();
+    } catch (const std::exception& e) {
+        THROW_URMA(env, e.what());
+    }
+}
+
 // UrmaNative.nativeWrite(long handle, long remoteAddr, long remoteLen, int remoteToken,
+//                         long remoteGeneration,
 //                         ByteBuffer source, int offset, int length) -> long requestId
 JNIEXPORT jlong JNICALL
 Java_org_scache_network_ub_UrmaNative_nativeWrite(
     JNIEnv* env, jclass clazz, jlong handle,
-    jlong remoteAddr, jlong remoteLen, jint remoteToken,
+    jlong remoteAddr, jlong remoteLen, jint remoteToken, jlong remoteGeneration,
     jobject source, jint offset, jint length)
 {
     (void)clazz;
@@ -260,6 +282,7 @@ Java_org_scache_network_ub_UrmaNative_nativeWrite(
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
         remote.token = static_cast<uint64_t>(remoteToken);
+        remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->write(remote, addr, static_cast<size_t>(length));
         return static_cast<jlong>(req_id);
@@ -270,11 +293,12 @@ Java_org_scache_network_ub_UrmaNative_nativeWrite(
 }
 
 // UrmaNative.nativeRead(long handle, long remoteAddr, long remoteLen, int remoteToken,
+//                        long remoteGeneration,
 //                        ByteBuffer destination, int offset, int length) -> long requestId
 JNIEXPORT jlong JNICALL
 Java_org_scache_network_ub_UrmaNative_nativeRead(
     JNIEnv* env, jclass clazz, jlong handle,
-    jlong remoteAddr, jlong remoteLen, jint remoteToken,
+    jlong remoteAddr, jlong remoteLen, jint remoteToken, jlong remoteGeneration,
     jobject destination, jint offset, jint length)
 {
     (void)clazz;
@@ -288,6 +312,7 @@ Java_org_scache_network_ub_UrmaNative_nativeRead(
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
         remote.token = static_cast<uint64_t>(remoteToken);
+        remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->read(remote, addr, static_cast<size_t>(length));
         return static_cast<jlong>(req_id);
@@ -349,11 +374,12 @@ Java_org_scache_network_ub_UrmaNative_nativeWait(
 }
 
 // UrmaNative.nativeWriteChunked(long handle, long remoteAddr, long remoteLen, int remoteToken,
+//                                long remoteGeneration,
 //                                ByteBuffer source, int offset, int totalLength) -> long requestId
 JNIEXPORT jlong JNICALL
 Java_org_scache_network_ub_UrmaNative_nativeWriteChunked(
     JNIEnv* env, jclass clazz, jlong handle,
-    jlong remoteAddr, jlong remoteLen, jint remoteToken,
+    jlong remoteAddr, jlong remoteLen, jint remoteToken, jlong remoteGeneration,
     jobject source, jint offset, jint totalLength)
 {
     (void)clazz;
@@ -367,6 +393,7 @@ Java_org_scache_network_ub_UrmaNative_nativeWriteChunked(
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
         remote.token = static_cast<uint64_t>(remoteToken);
+        remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->write_chunked(remote, addr,
                                                      static_cast<size_t>(totalLength));
@@ -378,11 +405,12 @@ Java_org_scache_network_ub_UrmaNative_nativeWriteChunked(
 }
 
 // UrmaNative.nativeReadChunked(long handle, long remoteAddr, long remoteLen, int remoteToken,
+//                               long remoteGeneration,
 //                               ByteBuffer dest, int offset, int totalLength) -> long requestId
 JNIEXPORT jlong JNICALL
 Java_org_scache_network_ub_UrmaNative_nativeReadChunked(
     JNIEnv* env, jclass clazz, jlong handle,
-    jlong remoteAddr, jlong remoteLen, jint remoteToken,
+    jlong remoteAddr, jlong remoteLen, jint remoteToken, jlong remoteGeneration,
     jobject dest, jint offset, jint totalLength)
 {
     (void)clazz;
@@ -396,6 +424,7 @@ Java_org_scache_network_ub_UrmaNative_nativeReadChunked(
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
         remote.token = static_cast<uint64_t>(remoteToken);
+        remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->read_chunked(remote, addr,
                                                     static_cast<size_t>(totalLength));

@@ -491,8 +491,8 @@ class Daemon(
     ret
   }
 
-  def releaseShuffle(appName: String, shuffleId: Int): Int = {
-    askClient[Int]("release-shuffle", ReleaseShuffle(appName, shuffleId))
+  def releaseShuffle(appName: String, jobId: Int, shuffleId: Int): Int = {
+    askClient[Int]("release-shuffle", ReleaseShuffle(appName, jobId, shuffleId))
   }
 
   def releaseApplication(appName: String): Int = {

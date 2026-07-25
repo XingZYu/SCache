@@ -145,10 +145,7 @@ public final class FileSegmentManagedBuffer extends ManagedBuffer {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("file", file)
-      .add("offset", String.valueOf(offset))
-      .add("length", String.valueOf(length))
-      .toString();
+    return getClass().getSimpleName() + "{file=" + file + ", offset=" + offset
+      + ", length=" + length + "}";
   }
 }

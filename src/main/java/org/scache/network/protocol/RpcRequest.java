@@ -78,9 +78,7 @@ public final class RpcRequest extends AbstractMessage implements RequestMessage 
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("requestId", String.valueOf(requestId))
-      .add("body", body())
-      .toString();
+    return getClass().getSimpleName() + "{requestId=" + requestId
+      + ", body=" + body() + "}";
   }
 }

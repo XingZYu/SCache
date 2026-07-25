@@ -332,10 +332,25 @@ class ScacheClient(
       }
     case RegisterShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask) =>
       context.reply(registerShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask))
-    case ReleaseShuffle(appName, shuffleId) =>
-      context.reply(blockManagerMaster.releaseCxlAppShuffle(appName, shuffleId))
+    case ReleaseShuffle(appName, jobId, shuffleId) =>
+      // Release is application-wide: the driver daemon may be connected to
+      // one client while shuffle blocks live on every executor client.
+      // Broadcast through the SCache master so every client withdraws its UB
+      // descriptors before its arena is reused.
+      // The master broadcast includes this client endpoint.  Waiting from the
+      // RPC dispatcher thread would therefore wait for a message that cannot
+      // be dispatched until this handler returns.  Run the blocking wait on
+      // the existing async pool so the endpoint remains responsive.
+      doAsync[Int](s"Removing shuffle $appName:$jobId:$shuffleId", context) {
+        blockManagerMaster.removeShuffle(
+          shuffleId, blocking = true, appName = appName, jobId = jobId)
+        blockManagerMaster.releaseCxlAppShuffle(appName, shuffleId, jobId)
+      }
     case ReleaseApplication(appName) =>
-      context.reply(blockManagerMaster.releaseCxlApplication(appName))
+      doAsync[Int](s"Removing application $appName", context) {
+        blockManagerMaster.removeApplication(appName, blocking = true)
+        blockManagerMaster.releaseCxlApplication(appName)
+      }
     case GetShuffleStatus(appName, jobId, shuffleId) =>
       context.reply(getShuffleStatus(appName, jobId, shuffleId))
     case GetBlock(blockId) =>

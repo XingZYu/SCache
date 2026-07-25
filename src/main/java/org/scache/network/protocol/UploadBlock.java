@@ -65,13 +65,9 @@ public class UploadBlock extends BlockTransferMessage {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("appId", appId)
-      .add("execId", execId)
-      .add("blockId", blockId)
-      .add("metadata size", String.valueOf(metadata.length))
-      .add("block size", String.valueOf(blockData.length))
-      .toString();
+    return getClass().getSimpleName() + "{appId=" + appId + ", execId=" + execId
+      + ", blockId=" + blockId + ", metadata size=" + metadata.length
+      + ", block size=" + blockData.length + "}";
   }
 
   @Override

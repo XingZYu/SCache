@@ -120,7 +120,7 @@ class BlockManagerMaster(
 
   /** Remove all blocks belonging to the given RDD. */
   def removeRdd(rddId: Int, blocking: Boolean): Unit = {
-    val future = driverEndpoint.askWithRetry[Future[Seq[Int]]](RemoveRdd(rddId))
+    val future = driverEndpoint.ask[Seq[Int]](RemoveRdd(rddId))
     future.onComplete {
       case Failure(e: Exception) =>
         logWarning(s"Failed to remove RDD $rddId - ${e.getMessage}", e)
@@ -132,21 +132,29 @@ class BlockManagerMaster(
   }
 
   /** Remove all blocks belonging to the given shuffle. */
-  def removeShuffle(shuffleId: Int, blocking: Boolean): Unit = {
-    val future = driverEndpoint.askWithRetry[Future[Seq[Boolean]]](RemoveShuffle(shuffleId))
-    future.onComplete {
-      case Failure(e: Exception) =>
-        logWarning(s"Failed to remove shuffle $shuffleId - ${e.getMessage}", e)
-      case _ =>
-    }(ThreadUtils.sameThread)
-    if (blocking) {
-      timeout.awaitResult(future)
-    }
+  def removeShuffle(
+      shuffleId: Int,
+      blocking: Boolean,
+      appName: String = "",
+      jobId: Int = -1): Unit = {
+    // The endpoint completes this RPC only after all slave removals finish.
+    // Do not transport a scala.concurrent.Future over RPC: it is not a
+    // stable wire value and forces the master serializer to walk its
+    // implementation details.
+    driverEndpoint.askWithRetry[Seq[Int]](
+      RemoveShuffle(shuffleId, appName, jobId))
+  }
+
+  /** Remove every SCache block for an application from all registered clients. */
+  def removeApplication(appName: String, blocking: Boolean): Unit = {
+    // See removeShuffle: the master replies with a concrete result after the
+    // asynchronous slave fan-out has completed.
+    driverEndpoint.askWithRetry[Seq[Int]](RemoveApplication(appName))
   }
 
   /** Remove all blocks belonging to the given broadcast. */
   def removeBroadcast(broadcastId: Long, removeFromMaster: Boolean, blocking: Boolean): Unit = {
-    val future = driverEndpoint.askWithRetry[Future[Seq[Int]]](
+    val future = driverEndpoint.ask[Seq[Int]](
       RemoveBroadcast(broadcastId, removeFromMaster))
     future.onComplete {
       case Failure(e: Exception) =>
@@ -265,8 +273,8 @@ class BlockManagerMaster(
     driverEndpoint.askWithRetry[Boolean](ReleaseCxlBlock(blockId))
   }
 
-  def releaseCxlAppShuffle(appName: String, shuffleId: Int): Int = {
-    driverEndpoint.askWithRetry[Int](ReleaseCxlAppShuffle(appName, shuffleId))
+  def releaseCxlAppShuffle(appName: String, shuffleId: Int, jobId: Int = -1): Int = {
+    driverEndpoint.askWithRetry[Int](ReleaseCxlAppShuffle(appName, shuffleId, jobId))
   }
 
   def releaseCxlApplication(appName: String): Int = {

@@ -16,10 +16,12 @@ public class EndpointDescriptor {
     public long segmentAddress;
     public long segmentLength;
     public int segmentToken;
-    public int maxChunkBytes = 4096;
+    public long segmentGeneration;
+    public int segmentUasid;
+    public int maxChunkBytes = 10 * 1024 * 1024;
     public int transportMode;
 
-    private static final int SIZE = 64; // 4+4+4+4(pad)+16+8+8+4+4+4+4(pad) ≈ 64
+    private static final int SIZE = 72; // 64-byte descriptor plus provider MR generation
 
     public byte[] toBytes() {
         validate();
@@ -34,7 +36,8 @@ public class EndpointDescriptor {
         bb.putInt(segmentToken);
         bb.putInt(maxChunkBytes);
         bb.putInt(transportMode);
-        bb.putInt(0); // padding
+        bb.putInt(segmentUasid); // former final padding: provider segment EID index
+        bb.putLong(segmentGeneration);
         return bb.array();
     }
 
@@ -54,7 +57,8 @@ public class EndpointDescriptor {
         ep.segmentToken = bb.getInt();
         ep.maxChunkBytes = bb.getInt();
         ep.transportMode = bb.getInt();
-        bb.getInt();
+        ep.segmentUasid = bb.getInt();
+        ep.segmentGeneration = bb.getLong();
         ep.validate();
         return ep;
     }
@@ -63,8 +67,8 @@ public class EndpointDescriptor {
         if (protocolVersion != 1) throw new UrmaProtocolException("unsupported endpoint protocol " + protocolVersion);
         if (eid == null || eid.length != 16) throw new UrmaProtocolException("EID must be exactly 16 bytes");
         if (segmentAddress < 0 || segmentLength < 0) throw new UrmaProtocolException("negative segment field");
-        if (maxChunkBytes <= 0 || maxChunkBytes > 4096)
-            throw new UrmaProtocolException("invalid Tier S maxChunkBytes " + maxChunkBytes);
+        if (maxChunkBytes <= 0)
+            throw new UrmaProtocolException("invalid provider maxChunkBytes " + maxChunkBytes);
     }
 
     @Override

@@ -50,6 +50,26 @@ class BlockManagerSlaveEndpoint(
         true
       }
 
+    case RemoveRdd(rddId) =>
+      doAsync[Int]("removing RDD " + rddId, context) {
+        blockManager.removeRdd(rddId)
+      }
+
+    case RemoveShuffle(shuffleId, appName, jobId) =>
+      doAsync[Int](s"removing shuffle $appName:$jobId:$shuffleId", context) {
+        blockManager.removeShuffle(appName, shuffleId, jobId)
+      }
+
+    case RemoveApplication(appName) =>
+      doAsync[Int](s"removing application $appName", context) {
+        blockManager.removeApplication(appName)
+      }
+
+    case RemoveBroadcast(broadcastId, tellMaster) =>
+      doAsync[Int]("removing broadcast " + broadcastId, context) {
+        blockManager.removeBroadcast(broadcastId, tellMaster)
+      }
+
     case GetBlockStatus(blockId, _) =>
       context.reply(blockManager.getStatus(blockId))
 

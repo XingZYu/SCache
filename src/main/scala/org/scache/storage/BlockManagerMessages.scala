@@ -50,8 +50,15 @@ private[scache] object BlockManagerMessages {
   // Remove all blocks belonging to a specific RDD.
   case class RemoveRdd(rddId: Int) extends ToBlockManagerSlave
 
-  // Remove all blocks belonging to a specific shuffle.
-  case class RemoveShuffle(shuffleId: Int) extends ToBlockManagerSlave
+  // Remove blocks belonging to one Spark job's shuffle.  jobId=-1 preserves
+  // the legacy whole-shuffle behavior for callers that explicitly need it.
+  case class RemoveShuffle(
+      shuffleId: Int,
+      appName: String = "",
+      jobId: Int = -1) extends ToBlockManagerSlave
+
+  // Remove every SCache shuffle block belonging to an application namespace.
+  case class RemoveApplication(appName: String) extends ToBlockManagerSlave
 
   // Remove all blocks belonging to a specific broadcast.
   case class RemoveBroadcast(broadcastId: Long, removeFromDriver: Boolean = true)
@@ -189,8 +196,11 @@ private[scache] object BlockManagerMessages {
   /** Remove a block's shared CXL pool metadata and free the slice (best effort). */
   case class ReleaseCxlBlock(blockId: BlockId) extends ToBlockManagerMaster
 
-  /** Release all shared-CXL blocks for one application shuffle. */
-  case class ReleaseCxlAppShuffle(appName: String, shuffleId: Int) extends ToBlockManagerMaster
+  /** Release all shared-CXL blocks for one application job/shuffle. */
+  case class ReleaseCxlAppShuffle(
+      appName: String,
+      shuffleId: Int,
+      jobId: Int = -1) extends ToBlockManagerMaster
 
   /** Release all shared-CXL blocks for one application, including late registrations. */
   case class ReleaseCxlApplication(appName: String) extends ToBlockManagerMaster

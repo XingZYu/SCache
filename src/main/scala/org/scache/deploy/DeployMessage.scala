@@ -46,7 +46,10 @@ private[deploy] object DeployMessages {
   case class GetBlockIpc(scacheBlockId: BlockId) extends FromDaemon
   case class GetBlocksIpc(scacheBlockIds: Seq[BlockId]) extends FromDaemon
   case class RegisterShuffle(appName: String, jobId: Int, ids: Array[Int], numMaps: Array[Int], numReduces: Array[Int]) extends FromDaemon
-  case class ReleaseShuffle(appName: String, shuffleId: Int) extends FromDaemon
+  // A shuffle id is only unique within a Spark application lifetime.  Include
+  // the Spark job id so job-end cleanup cannot remove a later job's blocks that
+  // happen to reuse the same shuffle id.
+  case class ReleaseShuffle(appName: String, jobId: Int, shuffleId: Int) extends FromDaemon
   case class ReleaseApplication(appName: String) extends FromDaemon
   case class MapEnd(appName: String, jobId: Int, shuffleId: Int, mapId: Int) extends FromDaemon
   case class GetShuffleStatus(appName: String, jobId: Int, shuffleId: Int) extends FromDaemon

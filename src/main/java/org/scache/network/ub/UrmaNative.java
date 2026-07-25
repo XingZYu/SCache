@@ -35,7 +35,9 @@ public final class UrmaNative {
     // ---- Lifecycle ----
     static native long nativeInit(String deviceName, int queueDepth, int maxChunkBytes, boolean strict, String wireRole);
     static native void nativeConnect(long handle, byte[] eid, int uasid, int jettyId,
-                                      long segAddr, long segLen, int segToken);
+                                     int remoteMaxChunkBytes, int segmentUasid,
+                                     long segmentGeneration, long segAddr,
+                                     long segLen, int segToken);
     static native byte[] nativeGetLocalEndpoint(long handle);
     static native long[] nativeClose(long handle);
     static native void nativeShutdownProcessRuntime();
@@ -44,19 +46,24 @@ public final class UrmaNative {
     // ---- Buffer management ----
     static native long[] nativeRegisterBuffer(long handle, ByteBuffer directBuffer);
     static native void nativeUnregisterBuffer(long handle, long regionHandle);
+    static native void nativeReleaseCachedRemoteImports(long handle);
 
     // ---- Data operations ----
     static native long nativeWrite(long handle, long remoteAddr, long remoteLen, int remoteToken,
+                                    long remoteGeneration,
                                     ByteBuffer source, int offset, int length);
     static native long nativeRead(long handle, long remoteAddr, long remoteLen, int remoteToken,
+                                   long remoteGeneration,
                                    ByteBuffer destination, int offset, int length);
     static native long nativeSend(long handle, ByteBuffer message, int offset, int length);
 
     // ---- Chunked operations ----
     static native long nativeWriteChunked(long handle, long remoteAddr, long remoteLen,
-                                           int remoteToken, ByteBuffer source, int offset, int totalLength);
+                                           int remoteToken, long remoteGeneration,
+                                           ByteBuffer source, int offset, int totalLength);
     static native long nativeReadChunked(long handle, long remoteAddr, long remoteLen,
-                                          int remoteToken, ByteBuffer dest, int offset, int totalLength);
+                                          int remoteToken, long remoteGeneration,
+                                          ByteBuffer dest, int offset, int totalLength);
 
     // ---- Completion ----
     static native int nativeWait(long handle, long requestId, int timeoutMs);

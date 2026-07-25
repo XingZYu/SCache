@@ -72,8 +72,6 @@ public final class OneWayMessage extends AbstractMessage implements RequestMessa
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("body", body())
-      .toString();
+    return getClass().getSimpleName() + "{body=" + body() + "}";
   }
 }

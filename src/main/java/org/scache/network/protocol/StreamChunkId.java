@@ -65,9 +65,7 @@ public final class StreamChunkId implements Encodable {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("streamId", String.valueOf(streamId))
-      .add("chunkIndex", String.valueOf(chunkIndex))
-      .toString();
+    return getClass().getSimpleName() + "{streamId=" + streamId
+      + ", chunkIndex=" + chunkIndex + "}";
   }
 }

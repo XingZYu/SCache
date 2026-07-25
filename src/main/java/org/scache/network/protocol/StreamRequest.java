@@ -67,9 +67,7 @@ public final class StreamRequest extends AbstractMessage implements RequestMessa
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("streamId", String.valueOf(streamId))
-      .toString();
+    return getClass().getSimpleName() + "{streamId=" + streamId + "}";
   }
 
 }

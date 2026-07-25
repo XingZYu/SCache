@@ -53,7 +53,10 @@ private[scache] class UBBlockTransferService(
   private val arenaBytes = conf.getInt("spark.urma.arenaBytes",
     conf.getInt("spark.urma.bufferBytes", 64 * 1024 * 1024))
   private val arenaCount = conf.getInt("spark.urma.arenaCount", 2)
-  private val testReadDelayMs = conf.getInt("spark.urma.testReadDelayMs", 0)
+  private val transportBackend =
+    UbTransportFactory.normalizeBackend(conf.getString("scache.ub.transport", "real"))
+  require(transportBackend == "real",
+    s"production SCache supports only scache.ub.transport=real; got $transportBackend")
   private val wireRole = conf.getString("spark.urma.wireRole", "").trim
   private val wirePath = conf.getString("spark.urma.wirePath", "").trim
   private val controlBindHost = conf.getString("spark.urma.controlBindHost", hostName).trim
@@ -77,9 +80,9 @@ private[scache] class UBBlockTransferService(
 
   @volatile private var closed = false
   @volatile private var dataManager: BlockDataManager = _
-  @volatile private var transport: UrmaTransport = _
+  @volatile private var transport: UbTransport = _
   @volatile private var arena: RegisteredArenaPool = _
-  @volatile private var endpoint: EndpointDescriptor = _
+  @volatile private var endpoint: Array[Byte] = _
   @volatile private var server: ServerSocket = _
   @volatile private var acceptThread: Thread = _
   private val workers: ExecutorService = Executors.newCachedThreadPool()
@@ -87,34 +90,37 @@ private[scache] class UBBlockTransferService(
   @volatile private var connectedPeer: Array[Byte] = _
 
   override def init(blockDataManager: BlockDataManager): Unit = {
-    require(wireRole == "listen" || wireRole == "connect",
-      "spark.urma.wireRole must be explicitly listen or connect")
-    require(wirePath.nonEmpty, "spark.urma.wirePath must be explicitly configured")
     require(controlBindHost.nonEmpty && controlAdvertiseHost.nonEmpty,
       "UB control bind and advertise hosts must be explicit")
-    val launcherRole = Option(System.getenv("OPENURMA_WIRE_ROLE")).getOrElse("")
-    require(launcherRole == wireRole,
-      s"OPENURMA_WIRE_ROLE=$launcherRole does not match spark.urma.wireRole=$wireRole")
-    val launcherWirePath = Option(System.getenv("OPENURMA_WIRE_PATH")).getOrElse("")
-    require(launcherWirePath == wirePath,
-      s"OPENURMA_WIRE_PATH=$launcherWirePath does not match spark.urma.wirePath=$wirePath")
-    val device = wireRole match {
-      case "listen" => conf.getString("spark.urma.device.listen", "openurma0")
-      case "connect" => conf.getString("spark.urma.device.connect", "openurma1")
+    val device = {
+      require(wireRole == "listen" || wireRole == "connect",
+        "spark.urma.wireRole must be explicitly listen or connect")
+      require(wirePath.nonEmpty, "spark.urma.wirePath must be explicitly configured")
+      val launcherRole = Option(System.getenv("OPENURMA_WIRE_ROLE")).getOrElse("")
+      require(launcherRole == wireRole,
+        s"OPENURMA_WIRE_ROLE=$launcherRole does not match spark.urma.wireRole=$wireRole")
+      val launcherWirePath = Option(System.getenv("OPENURMA_WIRE_PATH")).getOrElse("")
+      require(launcherWirePath == wirePath,
+        s"OPENURMA_WIRE_PATH=$launcherWirePath does not match spark.urma.wirePath=$wirePath")
+      wireRole match {
+        case "listen" => conf.getString("spark.urma.device.listen", "openurma0")
+        case "connect" => conf.getString("spark.urma.device.connect", "openurma1")
+      }
     }
     try {
       dataManager = blockDataManager
-      transport = UrmaTransport.open(device, conf.getInt("spark.urma.queueDepth", 128),
-        conf.getInt("spark.urma.chunkSize", 4096), strictMode, wireRole)
+      transport = UbTransportFactory.open(transportBackend, device,
+        conf.getInt("spark.urma.queueDepth", 128), conf.getInt("spark.urma.chunkSize", 4096),
+        strictMode, wireRole)
       require(arenaCount > 0, "spark.urma.arenaCount must be positive")
       arena = new RegisteredArenaPool(transport, arenaBytes, arenaCount, nodeId, epoch, leaseTimeoutMs)
-      endpoint = transport.getLocalEndpoint
+      endpoint = transport.localEndpoint()
       server = new ServerSocket(conf.getInt("spark.urma.controlPort", 0), 64,
         InetAddress.getByName(controlBindHost))
       acceptThread = new Thread(() => acceptLoop(), s"ub-control-$nodeId")
       acceptThread.setDaemon(true)
       acceptThread.start()
-      summary(s"UB BlockTransferService ready node=$nodeId epoch=$epoch role=$wireRole " +
+      summary(s"UB BlockTransferService ready node=$nodeId epoch=$epoch backend=$transportBackend role=$wireRole " +
         s"device=$device wirePath=$wirePath control=$controlAdvertiseHost:${server.getLocalPort} " +
           s"arenaBytes=${arena.capacity} arenas=${arena.arenaCount}")
     } catch {
@@ -138,6 +144,17 @@ private[scache] class UBBlockTransferService(
   /** Called by BlockManager before memory/disk removal, so no stale descriptor survives it. */
   private[scache] def unpublishBlock(blockId: BlockId): Unit = {
     if (arena != null) arena.unpublish(blockId.toString, unpublishTimeoutMs)
+  }
+
+  /**
+   * Application-release hook: all Spark/SCache leases must already be drained.
+   * This releases cached peer MR imports without restarting the client or transport.
+   */
+  private[scache] def releaseCachedRemoteImports(): Unit = {
+    if (transport != null) {
+      transport.releaseCachedRemoteImports()
+      trace(s"SCACHE_UB_REMOTE_IMPORTS_RELEASED nodeId=$nodeId nodeEpoch=$epoch")
+    }
   }
 
   /** Phase-4 negative-test probe: exercises the real control ACQUIRE/RELEASE path without payload. */
@@ -210,9 +227,9 @@ private[scache] class UBBlockTransferService(
                 var rejected = false
                 try {
                   val remote = if (caseId == "remote_bounds")
-                    new RemoteBuffer(d.remoteAddress, math.max(1L, d.length.toLong - 1L), d.token)
-                  else new RemoteBuffer(d.remoteAddress, math.max(1L, d.length.toLong), d.token + 1)
-                  val request = transport.readChunked(remote, local.buffer, 0, math.max(1, d.length))
+                    new RemoteBuffer(d.remoteAddress, math.max(1L, d.length.toLong - 1L), d.token, d.segmentGeneration)
+                  else new RemoteBuffer(d.remoteAddress, math.max(1L, d.length.toLong), d.token + 1, d.segmentGeneration)
+                  val request = transport.read(remote, 0L, local.buffer, 0, math.max(1, d.length))
                   rejected = transport.waitFor(request, timeoutMs) != 0
                 } catch { case NonFatal(_) => rejected = true }
                 if (!rejected) throw new IllegalStateException(s"$caseId descriptor was accepted")
@@ -290,28 +307,7 @@ private[scache] class UBBlockTransferService(
           val localArena = arena
           val local = localArena.allocateScratch(descriptor.length)
           try {
-            if (testReadDelayMs > 0) Thread.sleep(testReadDelayMs.toLong)
-            if (descriptor.length > 0) {
-              val request = transport.readChunked(descriptor.remote, local.buffer, 0, descriptor.length)
-              val chunkCount = (descriptor.length + transport.maxChunkBytes - 1) / transport.maxChunkBytes
-              trace(s"SCACHE_UB_NATIVE_AGGREGATE transferId=$transferId blockId=$blockId " +
-                s"aggregateRequestId=$request logicalBytes=${descriptor.length} chunkCount=$chunkCount terminal=SUBMITTED")
-              await(request, descriptor.length, isRead = true)
-              var chunkIndex = 0
-              var chunkOffset = 0
-              while (chunkOffset < descriptor.length) {
-                val chunkLength = math.min(transport.maxChunkBytes, descriptor.length - chunkOffset)
-                if (traceDiagnostics &&
-                    (chunkIndex < traceChunkSampleLimit || chunkIndex == chunkCount - 1)) {
-                  trace(s"SCACHE_UB_NATIVE_CHUNK transferId=$transferId blockId=$blockId " +
-                    s"aggregateRequestId=$request chunkIndex=$chunkIndex chunkOffset=$chunkOffset " +
-                    s"chunkLength=$chunkLength chunkCount=$chunkCount sampled=true " +
-                    s"providerTerminal=SUCCESS apiTerminal=SUCCESS")
-                }
-                chunkIndex += 1
-                chunkOffset += chunkLength
-              }
-            }
+            transferRead(descriptor, local.buffer, transferId, blockId)
             val actual = crc(local.buffer, descriptor.length)
             if (actual != descriptor.crc) {
               checksumErrors.incrementAndGet()
@@ -361,10 +357,7 @@ private[scache] class UBBlockTransferService(
             case Grant(descriptor) =>
               validateDescriptor(descriptor, peer, blockId.toString)
               try {
-                if (sourceBytes.nonEmpty) {
-                  val request = transport.writeChunked(descriptor.remote, source.buffer, 0, sourceBytes.length)
-                  await(request, sourceBytes.length, isRead = false)
-                }
+                transferWrite(descriptor, source.buffer, sourceBytes.length)
                 channel.exchange(Commit(descriptor.leaseId, descriptor.generation)) match {
                   case Ack => ()
                   case ErrorResponse(message) => throw new IllegalStateException(message)
@@ -384,12 +377,51 @@ private[scache] class UBBlockTransferService(
     }
   }
 
+  /** Split a block into backend-neutral logical calls; one transport call remains one operation. */
+  private def transferRead(
+      descriptor: Descriptor, destination: ByteBuffer, transferId: String, blockId: String): Unit = {
+    transferLogical(descriptor.length) { (offset, length, index, count) =>
+      val request = transport.read(descriptor.remote, offset.toLong, destination, offset, length)
+      trace(s"SCACHE_UB_LOGICAL_READ transferId=$transferId blockId=$blockId " +
+        s"requestId=$request operationIndex=$index operationCount=$count offset=$offset " +
+        s"length=$length terminal=SUBMITTED")
+      await(request, length, isRead = true)
+    }
+  }
+
+  private def transferWrite(descriptor: Descriptor, source: ByteBuffer, blockLength: Int): Unit = {
+    transferLogical(blockLength) { (offset, length, _, _) =>
+      val request = transport.write(descriptor.remote, offset.toLong, source, offset, length)
+      await(request, length, isRead = false)
+    }
+  }
+
+  private def transferLogical(blockLength: Int)(operation: (Int, Int, Int, Int) => Unit): Unit = {
+    require(blockLength >= 0, s"negative block length $blockLength")
+    if (blockLength == 0) return
+    val advertised = transport.capabilities().maxLogicalOperationBytes
+    require(advertised > 0, s"transport advertised invalid logical limit $advertised")
+    val logicalLimit = math.min(Int.MaxValue.toLong, advertised).toInt
+    val operationCount = ((blockLength.toLong + logicalLimit - 1L) / logicalLimit).toInt
+    var offset = 0
+    var index = 0
+    while (offset < blockLength) {
+      val length = math.min(logicalLimit, blockLength - offset)
+      operation(offset, length, index, operationCount)
+      offset = Math.addExact(offset, length)
+      index += 1
+    }
+    require(index == operationCount && offset == blockLength,
+      s"logical transfer accounting mismatch operations=$index/$operationCount bytes=$offset/$blockLength")
+  }
+
   private def await(request: Long, bytes: Int, isRead: Boolean): Unit = {
     lastNativeRequestId.set(request)
     try {
       val status = transport.waitFor(request, timeoutMs)
       if (status != 0) throw new IllegalStateException(s"URMA completion status=$status")
-      completedChunks.addAndGet((bytes + transport.maxChunkBytes - 1) / transport.maxChunkBytes)
+      val rawOperationBytes = transport.capabilities().maxRawOperationBytes
+      completedChunks.addAndGet((bytes.toLong + rawOperationBytes - 1L) / rawOperationBytes)
     } catch {
       case NonFatal(e) => failedChunks.incrementAndGet(); throw e
     }
@@ -421,8 +453,12 @@ private[scache] class UBBlockTransferService(
       val channel = new ControlChannel(socket)
       val peer = channel.receiveRequest() match {
         case Hello(remoteNode, remoteEpoch, remoteEndpoint) =>
+          // Complete the TCP HELLO handshake before importing/binding the remote
+          // jetty.  Both peers call ensureConnected after receiving this reply;
+          // doing it before the reply deadlocks the first cross-process control
+          // exchange because each provider waits for the other peer to bind.
+          channel.sendResponse(Hello(nodeId, epoch, endpoint.clone()))
           ensureConnected(remoteEndpoint)
-          channel.sendResponse(Hello(nodeId, epoch, endpoint.toBytes))
           PeerIdentity(remoteNode, remoteEpoch)
         case other => throw new IllegalStateException(s"control connection must start with HELLO, got $other")
       }
@@ -477,7 +513,7 @@ private[scache] class UBBlockTransferService(
     socket.setSoTimeout(timeoutMs)
     try {
       val channel = new ControlChannel(socket)
-      channel.exchange(Hello(nodeId, epoch, endpoint.toBytes)) match {
+      channel.exchange(Hello(nodeId, epoch, endpoint.clone())) match {
         case Hello(remoteNode, remoteEpoch, remoteEndpoint) =>
           ensureConnected(remoteEndpoint)
           val peer = PeerIdentity(remoteNode, remoteEpoch)
@@ -494,10 +530,10 @@ private[scache] class UBBlockTransferService(
 
   private def ensureConnected(remoteBytes: Array[Byte]): Unit = connectLock.synchronized {
     if (connectedPeer == null) {
-      transport.connect(EndpointDescriptor.fromBytes(remoteBytes))
+      transport.connect(remoteBytes)
       connectedPeer = remoteBytes.clone()
     } else if (!java.util.Arrays.equals(connectedPeer, remoteBytes)) {
-      transport.connect(EndpointDescriptor.fromBytes(remoteBytes))
+      transport.connect(remoteBytes)
       connectedPeer = remoteBytes.clone()
     }
   }
@@ -536,7 +572,9 @@ private[scache] class UBBlockTransferService(
   }
 
   private[scache] def urmaMetrics: Map[String, Long] = {
-    val native = if (transport == null || transport.isClosed) None else Some(transport.getMetrics)
+    val native = if (transport == null || transport.isClosed) None else Some(transport.metrics())
+    def backend(metric: UbTransportMetrics, name: String): Long =
+      Option(metric.backendCounters.get(name)).map(_.longValue()).getOrElse(0L)
     Map(
       "urma.blockReadRequests" -> readRequests.get(), "urma.blockWriteRequests" -> writeRequests.get(),
       "urma.completedChunks" -> completedChunks.get(), "urma.failedChunks" -> failedChunks.get(),
@@ -551,16 +589,28 @@ private[scache] class UBBlockTransferService(
       "urma.arenaPublishedBlocks" -> (if (arena == null) 0L else arena.publishedBlocks),
       "urma.activeLeases" -> (if (arena == null) 0L else arena.activeLeases),
       "urma.activeScratch" -> (if (arena == null) 0L else arena.activeScratch),
-      "urma.submittedChunks" -> native.map(_.submittedRequests).getOrElse(0L),
-      "urma.providerTerminalChunks" -> native.map(_.providerDrainedRequests).getOrElse(0L),
-      "urma.apiTerminalChunks" -> native.map(m => m.completedRequests + m.failedRequests + m.timedOutRequests).getOrElse(0L),
+      "urma.submittedChunks" -> native.map(backend(_, "submittedRequests")).getOrElse(0L),
+      "urma.providerTerminalChunks" -> native.map(backend(_, "providerDrainedRequests")).getOrElse(0L),
+      "urma.apiTerminalChunks" -> native.map(m => backend(m, "completedRequests") +
+        backend(m, "failedRequests") + backend(m, "timedOutRequests")).getOrElse(0L),
       "urma.submittedBytes" -> native.map(_.submittedBytes).getOrElse(0L),
       "urma.completedBytes" -> native.map(_.completedBytes).getOrElse(0L),
-      "urma.providerOutstanding" -> native.map(_.providerOutstandingRequests).getOrElse(0L),
-      "urma.nativeInflight" -> native.map(_.inflightRequests).getOrElse(0L),
-      "urma.registeredRegions" -> native.map(_.activeRegions).getOrElse(0L),
-      "urma.activeImports" -> native.map(_.activeImports).getOrElse(0L),
-      "urma.activeTransports" -> native.map(_.activeTransports).getOrElse(0L))
+      "urma.transportSubmittedOperations" -> native.map(_.submittedOperations).getOrElse(0L),
+      "urma.transportCompletedOperations" -> native.map(_.completedOperations).getOrElse(0L),
+      "urma.transportFailedOperations" -> native.map(_.failedOperations).getOrElse(0L),
+      "urma.transportTimedOutOperations" -> native.map(_.timedOutOperations).getOrElse(0L),
+      "urma.transportInflightOperations" -> native.map(_.inflightOperations).getOrElse(0L),
+      "urma.carrierBytes" -> native.map(backend(_, "carrierBytes")).getOrElse(0L),
+      "urma.carrierLateOperations" -> native.map(_.carrierLateOperations).getOrElse(0L),
+      "urma.controlPayloadBytes" -> native.map(backend(_, "controlPayloadBytes")).getOrElse(0L),
+      "urma.activeMappings" -> native.map(backend(_, "activeMappings")).getOrElse(0L),
+      "urma.activeTokens" -> native.map(backend(_, "registeredTokens")).getOrElse(0L),
+      "urma.activeSlots" -> native.map(backend(_, "activeSlots")).getOrElse(0L),
+      "urma.providerOutstanding" -> native.map(backend(_, "providerOutstandingRequests")).getOrElse(0L),
+      "urma.nativeInflight" -> native.map(backend(_, "inflightRequests")).getOrElse(0L),
+      "urma.registeredRegions" -> native.map(_.registeredRegions).getOrElse(0L),
+      "urma.activeImports" -> native.map(backend(_, "activeImports")).getOrElse(0L),
+      "urma.activeTransports" -> native.map(backend(_, "activeTransports")).getOrElse(0L))
   }
 
   private def crc(buffer: ByteBuffer, length: Int): Long = UBBlockTransferService.crc(buffer, length)
@@ -647,9 +697,11 @@ private[ub] object UBBlockTransferService {
   private case object Capabilities extends Message { val kind = 12 }
 
   private[ub] final case class Descriptor(protocolVersion: Int, nodeId: String, epoch: Long, arenaId: String,
-      baseAddress: Long, offset: Int, remoteAddress: Long, length: Int, token: Int, generation: Long,
-      crc: Long, leaseId: String, blockId: String) {
-    def remote: RemoteBuffer = new RemoteBuffer(remoteAddress, length.toLong, token)
+      baseAddress: Long, offset: Int, remoteAddress: Long, length: Int, token: Int,
+      segmentGeneration: Long, generation: Long, crc: Long, leaseId: String, blockId: String) {
+    // generation is the lease/block generation; segmentGeneration is the
+    // provider MR generation required by native-vdev import.
+    def remote: RemoteBuffer = new RemoteBuffer(remoteAddress, length.toLong, token, segmentGeneration)
   }
   private[ub] final case class Committed(blockId: String, bytes: Array[Byte], level: StorageLevel)
   private[ub] sealed trait ReleaseResult
@@ -669,12 +721,13 @@ private[ub] object UBBlockTransferService {
   private def putDescriptor(out: DataOutputStream, d: Descriptor): Unit = {
     out.writeInt(d.protocolVersion); putString(out, d.nodeId); out.writeLong(d.epoch); putString(out, d.arenaId)
     out.writeLong(d.baseAddress); out.writeInt(d.offset); out.writeLong(d.remoteAddress); out.writeInt(d.length)
-    out.writeInt(d.token); out.writeLong(d.generation); out.writeLong(d.crc); putString(out, d.leaseId); putString(out, d.blockId)
+    out.writeInt(d.token); out.writeLong(d.segmentGeneration); out.writeLong(d.generation); out.writeLong(d.crc)
+    putString(out, d.leaseId); putString(out, d.blockId)
   }
   private def getDescriptor(in: DataInputStream): Descriptor = {
     val version = in.readInt(); if (version != 1) throw new IllegalArgumentException(s"unsupported descriptor protocol $version")
     Descriptor(version, getString(in), in.readLong(), getString(in), in.readLong(), in.readInt(), in.readLong(),
-      in.readInt(), in.readInt(), in.readLong(), in.readLong(), getString(in), getString(in))
+      in.readInt(), in.readInt(), in.readLong(), in.readLong(), in.readLong(), getString(in), getString(in))
   }
   private def encode(message: Message): Array[Byte] = {
     val raw = new java.io.ByteArrayOutputStream(); val out = new DataOutputStream(raw)
@@ -694,7 +747,7 @@ private[ub] object UBBlockTransferService {
   private def decode(kind: Int, raw: Array[Byte]): Message = {
     val in = new DataInputStream(new java.io.ByteArrayInputStream(raw))
     val message: Message = kind match {
-      case 1 => val node = getString(in); val epoch = in.readLong(); val n = in.readInt(); if (n != 64) throw new IllegalArgumentException("invalid endpoint size"); val endpoint = new Array[Byte](n); in.readFully(endpoint); Hello(node, epoch, endpoint)
+      case 1 => val node = getString(in); val epoch = in.readLong(); val n = in.readInt(); if (n <= 0 || n > MaxControlFrame) throw new IllegalArgumentException("invalid endpoint size"); val endpoint = new Array[Byte](n); in.readFully(endpoint); Hello(node, epoch, endpoint)
       case 2 => Acquire(getString(in))
       case 3 => Grant(getDescriptor(in))
       case 4 => NotFound
@@ -713,7 +766,7 @@ private[ub] object UBBlockTransferService {
   }
 
   private[ub] def runProtocolContracts(): Seq[(String, Boolean)] = {
-    val d = Descriptor(1, "node", 7L, "arena", 0x1000L, 16, 0x1010L, 64, 3, 9L, 123L,
+    val d = Descriptor(1, "node", 7L, "arena", 0x1000L, 16, 0x1010L, 64, 3, 42L, 9L, 123L,
       "lease", "scache_contract_1_1_0_0")
     val messages: Seq[(String, Message)] = Seq(
       "hello" -> Hello("node", 7L, new Array[Byte](64)), "capabilities" -> Capabilities,
@@ -751,7 +804,7 @@ private[ub] object UBBlockTransferService {
     results.toSeq
   }
 
-  private[ub] def runArenaContracts(transport: UrmaTransport): Seq[(String, Boolean)] = {
+  private[ub] def runArenaContracts(transport: UbTransport): Seq[(String, Boolean)] = {
     val arena = new RegisteredArena(transport, 4096, "contract-node", 1L)
     val results = scala.collection.mutable.ArrayBuffer.empty[(String, Boolean)]
     def check(name: String)(body: => Boolean): Unit = {
@@ -840,7 +893,7 @@ private[ub] object UBBlockTransferService {
 
   /** A bounded set of stable registrations. Blocks and scratch buffers select an arena by space. */
   private[ub] final class RegisteredArenaPool(
-      transport: UrmaTransport,
+      transport: UbTransport,
       val bytesPerArena: Int,
       val arenaCount: Int,
       nodeId: String,
@@ -905,7 +958,7 @@ private[ub] object UBBlockTransferService {
 
   /** One stable registration; individual descriptors are offset windows in it. */
   private[ub] final class RegisteredArena(
-      transport: UrmaTransport,
+      transport: UbTransport,
       val capacity: Int,
       nodeId: String,
       epoch: Long,
@@ -1041,7 +1094,7 @@ private[ub] object UBBlockTransferService {
     }
     private[ub] def knowsLease(leaseId: String): Boolean = synchronized(leases.contains(leaseId) || releasedLeases.contains(leaseId))
     private[ub] def isRegistered: Boolean = synchronized(!registrationClosed)
-    private[ub] def transportMetrics: TransportMetrics = transport.getMetrics
+    private[ub] def transportMetrics: UbTransportMetrics = transport.metrics()
     def close(timeoutMs: Int = 60000): Unit = synchronized {
       if (registrationClosed) return
       closing = true
@@ -1051,11 +1104,13 @@ private[ub] object UBBlockTransferService {
       }
       if (leases.nonEmpty || scratchCount != 0) throw new IllegalStateException(
         s"timed out draining ${leases.size} UB leases and $scratchCount scratch slices")
-      while (transport.getMetrics.providerOutstandingRequests != 0 && System.nanoTime() < until) {
+      def providerOutstanding: Long = Option(transport.metrics().backendCounters
+        .get("providerOutstandingRequests")).map(_.longValue()).getOrElse(0L)
+      while (providerOutstanding != 0 && System.nanoTime() < until) {
         wait(math.max(1L, math.min(10L, (until - System.nanoTime()) / 1000000L)))
       }
-      if (transport.getMetrics.providerOutstandingRequests != 0) throw new IllegalStateException(
-        s"timed out draining ${transport.getMetrics.providerOutstandingRequests} provider requests")
+      if (providerOutstanding != 0) throw new IllegalStateException(
+        s"timed out draining $providerOutstanding provider requests")
       entries.values.foreach(entry => releaseSlice(entry.slice))
       entries.clear()
       transport.unregisterBuffer(registration)
@@ -1064,7 +1119,8 @@ private[ub] object UBBlockTransferService {
 
     private def descriptor(entry: Entry, lease: String) = Descriptor(1, nodeId, epoch, arenaId,
       registration.remoteAddress, entry.slice.offset, registration.remoteAddress + entry.slice.offset,
-      entry.slice.length, registration.token.toInt, entry.generation, entry.expectedCrc, lease, entry.blockId)
+      entry.slice.length, registration.token.toInt, registration.generation, entry.generation,
+      entry.expectedCrc, lease, entry.blockId)
     private def generation(): Long = { val value = nextGeneration; nextGeneration += 1; value }
     private def view(slice: Slice): ByteBuffer = { val copy = memory.duplicate(); copy.position(slice.offset); copy.limit(slice.offset + slice.length); copy.slice() }
     private def allocate(length: Int): Slice = {

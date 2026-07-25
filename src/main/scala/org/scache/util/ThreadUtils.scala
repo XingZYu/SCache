@@ -23,13 +23,21 @@ import scala.concurrent.{Await, Awaitable, ExecutionContext, ExecutionContextExe
 import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
 
-import com.google.common.util.concurrent.{MoreExecutors, ThreadFactoryBuilder}
+import com.google.common.util.concurrent.ThreadFactoryBuilder
 
 
 private[scache] object ThreadUtils {
 
-  private val sameThreadExecutionContext =
-    ExecutionContext.fromExecutorService(MoreExecutors.sameThreadExecutor())
+  // Do not use Guava's deprecated MoreExecutors.sameThreadExecutor(): Spark
+  // ships its own (newer) Guava on the application class path, where that
+  // method has been removed.  A direct java.util.concurrent.Executor has the
+  // same semantics and keeps the SCache assembly binary-compatible with the
+  // Guava versions used by Spark on both x86_64 and AArch64.
+  private val sameThreadExecutor = new Executor {
+    override def execute(command: Runnable): Unit = command.run()
+  }
+  private val sameThreadExecutionContext: ExecutionContextExecutor =
+    ExecutionContext.fromExecutor(sameThreadExecutor)
 
   /**
    * An `ExecutionContextExecutor` that runs each task in the thread that invokes `execute/submit`.

@@ -25,6 +25,8 @@ void EndpointDescriptor::to_network() {
     segment_token = htonl(segment_token);
     max_chunk_bytes = htonl(max_chunk_bytes);
     transport_mode = htonl(transport_mode);
+    segment_uasid = htonl(segment_uasid);
+    segment_generation = htobe64(segment_generation);
 }
 
 void EndpointDescriptor::from_network() {
@@ -36,6 +38,8 @@ void EndpointDescriptor::from_network() {
     segment_token = ntohl(segment_token);
     max_chunk_bytes = ntohl(max_chunk_bytes);
     transport_mode = ntohl(transport_mode);
+    segment_uasid = ntohl(segment_uasid);
+    segment_generation = be64toh(segment_generation);
 }
 
 // ---- TCP Control Channel ----

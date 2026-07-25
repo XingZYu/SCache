@@ -68,9 +68,7 @@ public final class ChunkFetchFailure extends AbstractMessage implements Response
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("streamChunkId", streamChunkId)
-      .add("errorString", errorString)
-      .toString();
+    return getClass().getSimpleName() + "{streamChunkId=" + streamChunkId
+      + ", errorString=" + errorString + "}";
   }
 }

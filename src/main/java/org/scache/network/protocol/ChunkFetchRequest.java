@@ -64,8 +64,6 @@ public final class ChunkFetchRequest extends AbstractMessage implements RequestM
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("streamChunkId", streamChunkId)
-      .toString();
+    return getClass().getSimpleName() + "{streamChunkId=" + streamChunkId + "}";
   }
 }

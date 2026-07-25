@@ -1611,6 +1611,44 @@ private[scache] class BlockManager(
     blocksToRemove.size
   }
 
+  /** Remove SCache shuffle blocks for one application job/shuffle namespace. */
+  def removeShuffle(appName: String, shuffleId: Int, jobId: Int = -1): Int = {
+    val blocksToRemove = (blockInfoManager.entries.map(_._1) ++ diskBlockManager.getAllBlocks())
+      .collect {
+        case blockId: ScacheBlockId
+            if blockId.shuffleId == shuffleId &&
+              (appName == null || appName.isEmpty || blockId.app == appName) &&
+              (jobId < 0 || blockId.jobId == jobId) => blockId
+      }
+      .distinct
+    blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster = false) }
+    if (blocksToRemove.nonEmpty) {
+      logInfo(s"SCACHE_RECLAIM_SHUFFLE app=$appName jobId=$jobId " +
+        s"shuffleId=$shuffleId blocks=${blocksToRemove.size}")
+    }
+    blocksToRemove.size
+  }
+
+  /** Remove all SCache blocks belonging to an application namespace. */
+  def removeApplication(appName: String): Int = {
+    val blocksToRemove = (blockInfoManager.entries.map(_._1) ++ diskBlockManager.getAllBlocks())
+      .collect {
+        case blockId: ScacheBlockId
+            if appName == null || appName.isEmpty || blockId.app == appName => blockId
+      }
+      .distinct
+    blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster = false) }
+    blockTransferService match {
+      case ub: org.scache.network.ub.UBBlockTransferService =>
+        ub.releaseCachedRemoteImports()
+      case _ =>
+    }
+    if (blocksToRemove.nonEmpty) {
+      logInfo(s"SCACHE_RECLAIM_APPLICATION app=$appName blocks=${blocksToRemove.size}")
+    }
+    blocksToRemove.size
+  }
+
   /**
    * Remove all blocks belonging to the given broadcast.
    */
@@ -1631,7 +1669,15 @@ private[scache] class BlockManager(
     blockInfoManager.lockForWriting(blockId) match {
       case None =>
         // The block has already been removed; do nothing.
-        logWarning(s"Asked to remove block $blockId, which does not exist")
+        // A disk-only block can survive without a BlockInfo entry after a failed
+        // registration. Still withdraw its UB descriptor and delete the file.
+        blockTransferService match {
+          case ub: org.scache.network.ub.UBBlockTransferService => ub.unpublishBlock(blockId)
+          case _ =>
+        }
+        if (!diskStore.remove(blockId)) {
+          logDebug(s"Asked to remove block $blockId, which does not exist")
+        }
       case Some(info) =>
         // Withdraw the remote descriptor before the underlying SCache bytes can disappear.
         // This waits for active URMA leases (bounded by the UB configuration) and preserves

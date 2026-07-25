@@ -65,7 +65,7 @@ option(BUILD_STANDALONE "Build standalone C++ transport library" OFF)
 if(BUILD_STANDALONE)
     add_library(spark_urma SHARED $<TARGET_OBJECTS:spark_urma_obj>)
     target_link_libraries(spark_urma PRIVATE
-        ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread)
+        ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread ${CMAKE_DL_LIBS})
 endif()
 
 # JNI shared library (libSparkUrma.so)
@@ -78,7 +78,7 @@ target_include_directories(SparkUrma PRIVATE
 target_compile_features(SparkUrma PRIVATE cxx_std_17)
 target_compile_options(SparkUrma PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(SparkUrma PRIVATE
-    ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread
+    ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread ${CMAKE_DL_LIBS}
 )
 include(GNUInstallDirs)
 install(TARGETS SparkUrma LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})

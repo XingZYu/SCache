@@ -45,10 +45,8 @@ public class StreamHandle extends BlockTransferMessage {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("streamId", String.valueOf(streamId))
-      .add("numChunks", String.valueOf(numChunks))
-      .toString();
+    return getClass().getSimpleName() + "{streamId=" + streamId
+      + ", numChunks=" + numChunks + "}";
   }
 
   @Override
