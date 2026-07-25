@@ -68,6 +68,51 @@ class ScacheClient(
     conf.getBoolean("scache.storage.cxl.shared.enabled", false)
   private val cxlSharedPoolPath =
     conf.getString("scache.storage.cxl.shared.pool.path", "").trim
+  // Reserving one shared-pool slice per shuffle partition makes every map writer perform a
+  // synchronous RPC against the single master allocator. Reserve a larger arena per client and
+  // sub-allocate locally instead. Individual blocks are still registered and released with their
+  // exact ranges, so the existing metadata and reclamation semantics remain unchanged.
+  private val cxlSharedArenaSizeBytes = {
+    val configured = conf.getSizeAsBytes("scache.storage.cxl.shared.arena.size", "256m")
+    Math.max(0L, Math.min(configured, Int.MaxValue.toLong)).toInt
+  }
+  private val cxlSharedAlignBytes =
+    Math.max(1, conf.getInt("scache.storage.cxl.shared.pool.align", 4096))
+  private val cxlArenaLock = new Object
+  private var cxlArenaNextOffset = 0L
+  private var cxlArenaEndOffset = 0L
+
+  private def alignCxlOffset(offset: Long): Long = {
+    val alignment = cxlSharedAlignBytes.toLong
+    ((offset + alignment - 1L) / alignment) * alignment
+  }
+
+  private def allocateCxlBlockFromArena(size: Int): Option[BlockManagerMessages.CxlBlockLocation] = {
+    if (size < 0) return None
+    if (size == 0) {
+      return blockManagerMaster.allocateCxlBlock(0)
+    }
+    if (cxlSharedArenaSizeBytes <= 0 || size > cxlSharedArenaSizeBytes) {
+      return blockManagerMaster.allocateCxlBlock(size)
+    }
+
+    cxlArenaLock.synchronized {
+      val alignedOffset = alignCxlOffset(cxlArenaNextOffset)
+      if (alignedOffset + size > cxlArenaEndOffset) {
+        val arena = blockManagerMaster.allocateCxlBlock(cxlSharedArenaSizeBytes)
+        if (arena.isEmpty) return None
+        cxlArenaNextOffset = arena.get.offset
+        cxlArenaEndOffset = arena.get.offset + arena.get.length
+      }
+
+      val blockOffset = alignCxlOffset(cxlArenaNextOffset)
+      if (blockOffset + size > cxlArenaEndOffset) {
+        return None
+      }
+      cxlArenaNextOffset = blockOffset + size
+      Some(BlockManagerMessages.CxlBlockLocation(cxlSharedPoolPath, blockOffset, size))
+    }
+  }
 
   @volatile private var poolAllocator: PoolAllocator = null
   @volatile private var poolFile: MmapPoolFile = null
@@ -399,7 +444,7 @@ class ScacheClient(
         cxlSharedEnabled && cxlSharedPoolPath.nonEmpty && !isLocalConsumer(blockId)
 
       if (useSharedCxlPool) {
-        blockManagerMaster.allocateCxlBlock(size) match {
+        allocateCxlBlockFromArena(size) match {
           case Some(loc) =>
             return IpcPoolSlice(loc.poolPath, loc.offset, loc.length)
           case None =>
