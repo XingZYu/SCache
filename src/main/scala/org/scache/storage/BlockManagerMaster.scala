@@ -230,8 +230,18 @@ class BlockManagerMaster(
     driverEndpoint.askWithRetry[Boolean](RegisterCxlBlock(blockId, location))
   }
 
+  def registerCxlBlocks(
+      blockIds: Array[BlockId],
+      locations: Array[CxlBlockLocation]): Boolean = {
+    driverEndpoint.askWithRetry[Boolean](RegisterCxlBlocks(blockIds, locations))
+  }
+
   def getCxlBlock(blockId: BlockId): Option[CxlBlockLocation] = {
     driverEndpoint.askWithRetry[Option[CxlBlockLocation]](GetCxlBlock(blockId))
+  }
+
+  def getCxlBlocks(blockIds: Array[BlockId]): Array[Option[CxlBlockLocation]] = {
+    driverEndpoint.askWithRetry[Array[Option[CxlBlockLocation]]](GetCxlBlocks(blockIds))
   }
 
   def releaseCxlBlock(blockId: BlockId): Boolean = {

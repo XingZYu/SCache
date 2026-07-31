@@ -132,8 +132,14 @@ class BlockManagerMasterEndpoint(
     case RegisterCxlBlock(blockId, location) =>
       context.reply(registerCxlBlock(blockId, location))
 
+    case RegisterCxlBlocks(blockIds, locations) =>
+      context.reply(registerCxlBlocks(blockIds, locations))
+
     case GetCxlBlock(blockId) =>
       context.reply(getCxlBlock(blockId))
+
+    case GetCxlBlocks(blockIds) =>
+      context.reply(getCxlBlocks(blockIds))
 
     case ReleaseCxlBlock(blockId) =>
       context.reply(releaseCxlBlock(blockId))
@@ -200,10 +206,42 @@ class BlockManagerMasterEndpoint(
     true
   }
 
+  private def registerCxlBlocks(
+      blockIds: Array[BlockId],
+      locations: Array[CxlBlockLocation]): Boolean = {
+    if (blockIds == null || locations == null || blockIds.length != locations.length) return false
+    if (!cxlSharedEnabled || cxlSharedPoolPath.isEmpty) return false
+    var i = 0
+    while (i < blockIds.length) {
+      val blockId = blockIds(i)
+      val location = locations(i)
+      if (blockId == null || location == null || location.length < 0 ||
+          location.offset < 0L || location.poolPath != cxlSharedPoolPath) {
+        return false
+      }
+      i += 1
+    }
+    cxlStateLock.synchronized {
+      i = 0
+      while (i < blockIds.length) {
+        cxlBlocks.put(blockIds(i), locations(i))
+        i += 1
+      }
+    }
+    true
+  }
+
   private def getCxlBlock(blockId: BlockId): Option[CxlBlockLocation] = {
     if (blockId == null) return None
     cxlStateLock.synchronized {
       cxlBlocks.get(blockId)
+    }
+  }
+
+  private def getCxlBlocks(blockIds: Array[BlockId]): Array[Option[CxlBlockLocation]] = {
+    if (blockIds == null) return Array.empty
+    cxlStateLock.synchronized {
+      blockIds.map(cxlBlocks.get)
     }
   }
 
