@@ -58,6 +58,8 @@ class ScacheClient(
     Math.min(bytes, Int.MaxValue.toLong).toInt
   }
   private val ipcPoolAlignBytes = conf.getInt("scache.daemon.ipc.pool.align", 4096)
+  private val mapRegionLocalCommitParallelism =
+    Math.max(1, conf.getInt("scache.shuffle.mapRegion.localCommitParallelism", 4))
   private val ipcPoolZeroCopyPut =
     conf.getBoolean("scache.daemon.ipc.pool.zeroCopy.put", false)
 
@@ -68,6 +70,53 @@ class ScacheClient(
     conf.getBoolean("scache.storage.cxl.shared.enabled", false)
   private val cxlSharedPoolPath =
     conf.getString("scache.storage.cxl.shared.pool.path", "").trim
+  private val cxlSharedForceAll =
+    conf.getBoolean("scache.storage.cxl.shared.forceAll", false)
+  // Reserving one shared-pool slice per shuffle partition makes every map writer perform a
+  // synchronous RPC against the single master allocator. Reserve a larger arena per client and
+  // sub-allocate locally instead. Individual blocks are still registered and released with their
+  // exact ranges, so the existing metadata and reclamation semantics remain unchanged.
+  private val cxlSharedArenaSizeBytes = {
+    val configured = conf.getSizeAsBytes("scache.storage.cxl.shared.arena.size", "256m")
+    Math.max(0L, Math.min(configured, Int.MaxValue.toLong)).toInt
+  }
+  private val cxlSharedAlignBytes =
+    Math.max(1, conf.getInt("scache.storage.cxl.shared.pool.align", 4096))
+  private val cxlArenaLock = new Object
+  private var cxlArenaNextOffset = 0L
+  private var cxlArenaEndOffset = 0L
+
+  private def alignCxlOffset(offset: Long): Long = {
+    val alignment = cxlSharedAlignBytes.toLong
+    ((offset + alignment - 1L) / alignment) * alignment
+  }
+
+  private def allocateCxlBlockFromArena(size: Int): Option[BlockManagerMessages.CxlBlockLocation] = {
+    if (size < 0) return None
+    if (size == 0) {
+      return blockManagerMaster.allocateCxlBlock(0)
+    }
+    if (cxlSharedArenaSizeBytes <= 0 || size > cxlSharedArenaSizeBytes) {
+      return blockManagerMaster.allocateCxlBlock(size)
+    }
+
+    cxlArenaLock.synchronized {
+      val alignedOffset = alignCxlOffset(cxlArenaNextOffset)
+      if (alignedOffset + size > cxlArenaEndOffset) {
+        val arena = blockManagerMaster.allocateCxlBlock(cxlSharedArenaSizeBytes)
+        if (arena.isEmpty) return None
+        cxlArenaNextOffset = arena.get.offset
+        cxlArenaEndOffset = arena.get.offset + arena.get.length
+      }
+
+      val blockOffset = alignCxlOffset(cxlArenaNextOffset)
+      if (blockOffset + size > cxlArenaEndOffset) {
+        return None
+      }
+      cxlArenaNextOffset = blockOffset + size
+      Some(BlockManagerMessages.CxlBlockLocation(cxlSharedPoolPath, blockOffset, size))
+    }
+  }
 
   @volatile private var poolAllocator: PoolAllocator = null
   @volatile private var poolFile: MmapPoolFile = null
@@ -231,9 +280,28 @@ class ScacheClient(
       doAsync[IpcLocation](s"Prepare IPC location for $blockId from daemon", context) {
         preparePutBlockFromDaemon(blockId, size)
       }
+    case PrepareMapRegion(blockIds, sizes) =>
+      doAsync[Array[IpcPoolSlice]](
+          s"Prepare map region with ${blockIds.length} slices", context) {
+        if (blockIds.length != sizes.length) {
+          Array.empty[IpcPoolSlice]
+        } else {
+          blockIds.indices.map { i =>
+            preparePutBlockFromDaemon(blockIds(i), sizes(i)) match {
+              case slice: IpcPoolSlice => slice
+              case other => throw new IllegalStateException(
+                s"Expected pool slice for ${blockIds(i)}, got $other")
+            }
+          }.toArray
+        }
+      }
     case PutBlock(blockId, size, ipc) =>
       doAsync[Boolean](s"Read block $blockId from daemon", context) {
         readBlockFromDaemon(context, blockId, size, ipc)
+      }
+    case PutMapRegion(blockIds, sizes, slices) =>
+      doAsync[Boolean](s"Commit map region with ${blockIds.length} slices", context) {
+        readMapRegionFromDaemon(blockIds, sizes, slices)
       }
     case RegisterShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask) =>
       context.reply(registerShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask))
@@ -246,6 +314,11 @@ class ScacheClient(
     case GetBlockIpc(blockId) =>
       doAsync[Option[IpcBlock]](s"Fetch IPC location for block ${blockId} from daemon", context) {
         getBlockIpcFromDaemon(context, blockId)
+      }
+    case GetBlocksIpc(blockIds) =>
+      doAsync[Array[Option[IpcBlock]]](
+          s"Fetch IPC locations for ${blockIds.length} blocks", context) {
+        getBlocksIpcFromDaemon(context, blockIds)
       }
     case _ =>
       logError("Empty message received !")
@@ -295,7 +368,7 @@ class ScacheClient(
   // }
 
   def readBlockFromDaemon(context: RpcCallContext, blockId: BlockId, size: Int, ipc: IpcLocation): Boolean= {
-    val localConsumer = isLocalConsumer(blockId)
+    val localConsumer = isLocalConsumer(blockId) && !cxlSharedForceAll
     val storageLevel =
       if (localConsumer) daemonPutStorageLevelLocal else daemonPutStorageLevelRemote
 
@@ -391,15 +464,58 @@ class ScacheClient(
       }
   }
 
+  private def readMapRegionFromDaemon(
+      blockIds: Array[BlockId],
+      sizes: Array[Int],
+      slices: Array[IpcPoolSlice]): Boolean = {
+    if (blockIds == null || sizes == null || slices == null ||
+        blockIds.length != sizes.length || sizes.length != slices.length) {
+      return false
+    }
+
+    val cxlIds = new ArrayBuffer[BlockId]()
+    val cxlLocations = new ArrayBuffer[BlockManagerMessages.CxlBlockLocation]()
+    val localSlices = new ArrayBuffer[(BlockId, Int, IpcPoolSlice)]()
+    var i = 0
+    while (i < blockIds.length) {
+      val blockId = blockIds(i)
+      val slice = slices(i)
+      if (sizes(i) != slice.length || sizes(i) < 0) return false
+      if ((!isLocalConsumer(blockId) || cxlSharedForceAll) && cxlSharedEnabled &&
+          cxlSharedPoolPath.nonEmpty && slice.poolPath == cxlSharedPoolPath) {
+        cxlIds += blockId
+        cxlLocations += BlockManagerMessages.CxlBlockLocation(
+          slice.poolPath, slice.offset, slice.length)
+      } else {
+        localSlices += ((blockId, sizes(i), slice))
+      }
+      i += 1
+    }
+
+    val cxlOk = cxlIds.isEmpty ||
+      blockManagerMaster.registerCxlBlocks(cxlIds.toArray, cxlLocations.toArray)
+    if (!cxlOk) return false
+
+    // Preserve the old writer's bounded parallelism without issuing one RPC per reduce slice.
+    localSlices.grouped(mapRegionLocalCommitParallelism).forall { group =>
+      Await.result(
+        Future.sequence(group.map { case (blockId, size, slice) =>
+          Future(readBlockFromDaemon(null, blockId, size, slice))
+        }),
+        Duration.Inf).forall(identity)
+    }
+  }
+
   private def preparePutBlockFromDaemon(blockId: BlockId, size: Int): IpcLocation = {
     if (size < 0) return IpcFile("")
 
     if (ipcBackend == "pool") {
       val useSharedCxlPool =
-        cxlSharedEnabled && cxlSharedPoolPath.nonEmpty && !isLocalConsumer(blockId)
+        cxlSharedEnabled && cxlSharedPoolPath.nonEmpty &&
+          (!isLocalConsumer(blockId) || cxlSharedForceAll)
 
       if (useSharedCxlPool) {
-        blockManagerMaster.allocateCxlBlock(size) match {
+        allocateCxlBlockFromArena(size) match {
           case Some(loc) =>
             return IpcPoolSlice(loc.poolPath, loc.offset, loc.length)
           case None =>
@@ -608,6 +724,34 @@ class ScacheClient(
     if (size < 0) return None
     if (size == 0) return Some(IpcBlock(0, IpcFile("")))
     Some(IpcBlock(size, IpcFile(getIpcFile(blockId.toString).getAbsolutePath)))
+  }
+
+  private def getBlocksIpcFromDaemon(
+      context: RpcCallContext,
+      blockIds: Array[BlockId]): Array[Option[IpcBlock]] = {
+    if (blockIds == null) return Array.empty
+    val cxlLocations =
+      if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty) {
+        try {
+          blockManagerMaster.getCxlBlocks(blockIds)
+        } catch {
+          case e: Exception =>
+            logWarning("Failed batch CXL metadata lookup; falling back to block lookups", e)
+            Array.fill[Option[BlockManagerMessages.CxlBlockLocation]](blockIds.length)(None)
+        }
+      } else {
+        Array.fill[Option[BlockManagerMessages.CxlBlockLocation]](blockIds.length)(None)
+      }
+
+    blockIds.indices.map { i =>
+      cxlLocations(i) match {
+        case Some(loc) if loc.poolPath != null && loc.poolPath.nonEmpty &&
+            loc.length >= 0 && loc.offset >= 0L =>
+          Some(IpcBlock(loc.length, IpcPoolSlice(loc.poolPath, loc.offset, loc.length)))
+        case _ =>
+          getBlockIpcFromDaemon(context, blockIds(i))
+      }
+    }.toArray
   }
 
   private def getShuffleStatus(blockId: BlockId): ShuffleStatus = {

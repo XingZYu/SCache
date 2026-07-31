@@ -129,8 +129,16 @@ private[scache] object BlockManagerMessages {
   /** Register a committed block as residing in the shared CXL pool. */
   case class RegisterCxlBlock(blockId: BlockId, location: CxlBlockLocation) extends ToBlockManagerMaster
 
+  /** Register all reduce slices in one committed map region with one master RPC. */
+  case class RegisterCxlBlocks(
+      blockIds: Array[BlockId],
+      locations: Array[CxlBlockLocation]) extends ToBlockManagerMaster
+
   /** Lookup a block's shared CXL pool location, if any. */
   case class GetCxlBlock(blockId: BlockId) extends ToBlockManagerMaster
+
+  /** Lookup many map-output slices with one metadata RPC. */
+  case class GetCxlBlocks(blockIds: Array[BlockId]) extends ToBlockManagerMaster
 
   /** Remove a block's shared CXL pool metadata and free the slice (best effort). */
   case class ReleaseCxlBlock(blockId: BlockId) extends ToBlockManagerMaster

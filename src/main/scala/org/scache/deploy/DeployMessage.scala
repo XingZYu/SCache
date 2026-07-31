@@ -26,9 +26,15 @@ private[deploy] object DeployMessages {
 
   sealed trait FromDaemon
   case class PreparePutBlock(scacheBlockId: BlockId, size: Int) extends FromDaemon
+  case class PrepareMapRegion(blockIds: Array[BlockId], sizes: Array[Int]) extends FromDaemon
   case class PutBlock(scacheBlockId: BlockId, size: Int, ipc: IpcLocation) extends FromDaemon
+  case class PutMapRegion(
+      blockIds: Array[BlockId],
+      sizes: Array[Int],
+      slices: Array[IpcPoolSlice]) extends FromDaemon
   case class GetBlock(scacheBlockId: BlockId) extends FromDaemon
   case class GetBlockIpc(scacheBlockId: BlockId) extends FromDaemon
+  case class GetBlocksIpc(blockIds: Array[BlockId]) extends FromDaemon
   case class RegisterShuffle(appName: String, jobId: Int, ids: Array[Int], numMaps: Array[Int], numReduces: Array[Int]) extends FromDaemon
   case class MapEnd(appName: String, jobId: Int, shuffleId: Int, mapId: Int) extends FromDaemon
   case class GetShuffleStatus(appName: String, jobId: Int, shuffleId: Int) extends FromDaemon

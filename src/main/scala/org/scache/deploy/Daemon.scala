@@ -111,6 +111,12 @@ class Daemon(
     }
   }
 
+  def preparePutMapRegion(blockIds: Array[String], sizes: Array[Int]): Array[IpcPoolSlice] = {
+    require(blockIds.length == sizes.length, "Mismatched map-region allocation arrays")
+    val ids = blockIds.map(BlockId.apply)
+    clientRef.askWithRetry[Array[IpcPoolSlice]](PrepareMapRegion(ids, sizes))
+  }
+
   /**
    * Publish a previously-prepared IPC pool slice as the final contents of the given block.
    * The SCache client will read the bytes from the IPC region and store them.
@@ -122,6 +128,24 @@ class Daemon(
       scacheBlockId,
       size,
       IpcPoolSlice(resolvedPoolPath, offset, size)))
+  }
+
+  /**
+   * Publish every reduce slice produced by one map with one daemon/client RPC.
+   */
+  def commitPutMapRegion(
+      blockIds: Array[String],
+      sizes: Array[Int],
+      poolPaths: Array[String],
+      offsets: Array[Long]): Boolean = {
+    require(blockIds.length == sizes.length && sizes.length == poolPaths.length &&
+      poolPaths.length == offsets.length, "Mismatched map-region manifest arrays")
+    val ids = blockIds.map(BlockId.apply)
+    val slices = sizes.indices.map { i =>
+      val path = Option(poolPaths(i)).filter(_.nonEmpty).getOrElse(ipcPoolPath)
+      IpcPoolSlice(path, offsets(i), sizes(i))
+    }.toArray
+    clientRef.askWithRetry[Boolean](PutMapRegion(ids, sizes, slices))
   }
 
   def putBlock(blockId: String, data: Array[Byte], rawLen: Int, compressedLen: Int): Unit = {
@@ -235,6 +259,11 @@ class Daemon(
       return None
     }
     clientRef.askWithRetry[Option[IpcBlock]](GetBlockIpc(scacheBlockId))
+  }
+
+  def getBlocksIpc(blockIds: Array[String]): Array[Option[IpcBlock]] = {
+    val ids = blockIds.map(BlockId.apply)
+    clientRef.askWithRetry[Array[Option[IpcBlock]]](GetBlocksIpc(ids))
   }
   def registerShuffles(jobId: Int, shuffleIds: Array[Int], maps: Array[Int], reduces: Array[Int]): Unit = {
     // Registration must be synchronous to ensure the shuffle is registered before returning.

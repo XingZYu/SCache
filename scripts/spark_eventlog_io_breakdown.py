@@ -76,11 +76,26 @@ class StageAgg:
     shuffle_read_remote_bytes_to_disk: int = 0
     shuffle_read_local_bytes: int = 0
     shuffle_read_records: int = 0
+    scache_fetch_count: int = 0
+    scache_fetch_time_ns: int = 0
+    scache_fetch_miss_count: int = 0
+    scache_fetch_retry_time_ns: int = 0
+    scache_batch_lookup_count: int = 0
+    scache_cxl_reservation_count: int = 0
+    scache_cxl_reservation_wait_ns: int = 0
+    scache_ipc_file_read_bytes: int = 0
+    scache_ipc_pool_read_bytes: int = 0
+    scache_direct_cxl_read_bytes: int = 0
+    scache_byte_array_read_bytes: int = 0
 
     # Shuffle write.
     shuffle_write_bytes: int = 0
     shuffle_write_records: int = 0
     shuffle_write_time_ns: int = 0
+    scache_pool_alloc_count: int = 0
+    scache_pool_alloc_time_ns: int = 0
+    scache_pool_commit_count: int = 0
+    scache_pool_commit_time_ns: int = 0
 
     # Spill.
     memory_spilled_bytes: int = 0
@@ -192,12 +207,39 @@ def _parse_eventlog(path: str) -> Tuple[Dict[str, str], Optional[int], Optional[
                     agg.shuffle_read_local_bytes += _safe_int(sr.get("Local Bytes Read"))
                     agg.shuffle_read_records += _safe_int(sr.get("Total Records Read"))
                     agg.shuffle_read_remote_req_ms += _safe_int(sr.get("Remote Requests Duration"))
+                    agg.scache_fetch_count += _safe_int(sr.get("SCache Fetch Count"))
+                    agg.scache_fetch_time_ns += _safe_int(sr.get("SCache Fetch Time Ns"))
+                    agg.scache_fetch_miss_count += _safe_int(sr.get("SCache Fetch Miss Count"))
+                    agg.scache_fetch_retry_time_ns += _safe_int(
+                        sr.get("SCache Fetch Retry Time Ns"))
+                    agg.scache_batch_lookup_count += _safe_int(
+                        sr.get("SCache Batch Lookup Count"))
+                    agg.scache_cxl_reservation_count += _safe_int(
+                        sr.get("SCache CXL Reservation Count"))
+                    agg.scache_cxl_reservation_wait_ns += _safe_int(
+                        sr.get("SCache CXL Reservation Wait Ns"))
+                    agg.scache_ipc_file_read_bytes += _safe_int(
+                        sr.get("SCache IPC File Read Bytes"))
+                    agg.scache_ipc_pool_read_bytes += _safe_int(
+                        sr.get("SCache IPC Pool Read Bytes"))
+                    agg.scache_direct_cxl_read_bytes += _safe_int(
+                        sr.get("SCache Direct CXL Read Bytes"))
+                    agg.scache_byte_array_read_bytes += _safe_int(
+                        sr.get("SCache Byte Array Read Bytes"))
 
                 sw = tm.get("Shuffle Write Metrics") or {}
                 if isinstance(sw, dict):
                     agg.shuffle_write_bytes += _safe_int(sw.get("Shuffle Bytes Written"))
                     agg.shuffle_write_records += _safe_int(sw.get("Shuffle Records Written"))
                     agg.shuffle_write_time_ns += _safe_int(sw.get("Shuffle Write Time"))
+                    agg.scache_pool_alloc_count += _safe_int(
+                        sw.get("SCache Pool Alloc Count"))
+                    agg.scache_pool_alloc_time_ns += _safe_int(
+                        sw.get("SCache Pool Alloc Time Ns"))
+                    agg.scache_pool_commit_count += _safe_int(
+                        sw.get("SCache Pool Commit Count"))
+                    agg.scache_pool_commit_time_ns += _safe_int(
+                        sw.get("SCache Pool Commit Time Ns"))
 
                 inp = tm.get("Input Metrics") or {}
                 if isinstance(inp, dict):
@@ -227,6 +269,16 @@ def _format_stage_line(meta: StageMeta, agg: StageAgg) -> str:
     if agg.shuffle_write_bytes or agg.shuffle_write_time_ns:
         add_kv("shuffleWrite", f"{_human_bytes(agg.shuffle_write_bytes)}, time={_human_ms(agg.shuffle_write_ms())}")
 
+    if (agg.scache_pool_alloc_count or agg.scache_pool_commit_count or
+            agg.scache_pool_alloc_time_ns or agg.scache_pool_commit_time_ns):
+        add_kv(
+            "scacheMapMetadata",
+            f"allocRPCs={agg.scache_pool_alloc_count}, "
+            f"allocTime={_human_ms(agg.scache_pool_alloc_time_ns / 1_000_000.0)}, "
+            f"commitRPCs={agg.scache_pool_commit_count}, "
+            f"commitTime={_human_ms(agg.scache_pool_commit_time_ns / 1_000_000.0)}",
+        )
+
     if (agg.shuffle_read_local_bytes or agg.shuffle_read_remote_bytes or agg.shuffle_read_fetch_wait_ms or
             agg.shuffle_read_local_blocks or agg.shuffle_read_remote_blocks):
         add_kv(
@@ -234,6 +286,23 @@ def _format_stage_line(meta: StageMeta, agg: StageAgg) -> str:
             f"local={_human_bytes(agg.shuffle_read_local_bytes)} ({agg.shuffle_read_local_blocks} blocks), "
             f"remote={_human_bytes(agg.shuffle_read_remote_bytes)} ({agg.shuffle_read_remote_blocks} blocks), "
             f"fetchWait={_human_ms(agg.shuffle_read_fetch_wait_ms)}",
+        )
+
+    if (agg.scache_fetch_count or agg.scache_ipc_file_read_bytes or
+            agg.scache_ipc_pool_read_bytes or agg.scache_direct_cxl_read_bytes or
+            agg.scache_byte_array_read_bytes):
+        add_kv(
+            "scacheReadPaths",
+            f"file={_human_bytes(agg.scache_ipc_file_read_bytes)}, "
+            f"pool={_human_bytes(agg.scache_ipc_pool_read_bytes)}, "
+            f"cxl={_human_bytes(agg.scache_direct_cxl_read_bytes)}, "
+            f"byteArray={_human_bytes(agg.scache_byte_array_read_bytes)}, "
+            f"fetches={agg.scache_fetch_count}, misses={agg.scache_fetch_miss_count}, "
+            f"batchLookups={agg.scache_batch_lookup_count}, "
+            f"cxlReservations={agg.scache_cxl_reservation_count}, "
+            f"cxlWait={_human_ms(agg.scache_cxl_reservation_wait_ns / 1_000_000.0)}, "
+            f"fetchTime={_human_ms(agg.scache_fetch_time_ns / 1_000_000.0)}, "
+            f"retryTime={_human_ms(agg.scache_fetch_retry_time_ns / 1_000_000.0)}",
         )
 
     if agg.disk_spilled_bytes or agg.memory_spilled_bytes:
@@ -343,4 +412,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
