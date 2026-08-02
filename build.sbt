@@ -2,7 +2,8 @@ name := "SCache"
 
 organization := "org.scache"
 
-scalaVersion := "2.13.18"
+// Keep the daemon ABI aligned with Spark 3.5 and Celeborn's published Spark 3 client.
+scalaVersion := "2.12.18"
 
 // Prefer local Maven cache (helps when working offline / in restricted-network environments).
 resolvers += Resolver.mavenLocal

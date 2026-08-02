@@ -194,7 +194,7 @@ private class ChunkedByteBufferInputStream(
   override def skip(bytes: Long): Long = {
     if (currentChunk != null) {
       val amountToSkip = math.min(bytes, currentChunk.remaining).toInt
-      currentChunk.position(currentChunk.position + amountToSkip)
+      currentChunk.position(currentChunk.position() + amountToSkip)
       if (currentChunk.remaining() == 0) {
         if (chunks.hasNext) {
           currentChunk = chunks.next()

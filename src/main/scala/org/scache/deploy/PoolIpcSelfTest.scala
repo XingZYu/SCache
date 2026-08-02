@@ -166,6 +166,26 @@ object PoolIpcSelfTest {
       chunkSizeBytes = opts.chunkBytes,
       alignBytes = opts.alignBytes)
 
+    // A failed allocation must not rewind the allocator and make a later call overlap live data.
+    // This regression only appeared once a long-running shuffle filled the complete pool.
+    val exhaustionAllocator = new PoolAllocator(
+      poolSizeBytes = 64L,
+      chunkSizeBytes = 64L,
+      alignBytes = 8)
+    val liveOffsets = (0 until 4).map { _ =>
+      exhaustionAllocator.allocate(16).getOrElse(
+        throw new IllegalStateException("Unexpected exhaustion in allocator regression test"))
+    }
+    assert(liveOffsets == Seq(0L, 16L, 32L, 48L), s"Unexpected offsets: $liveOffsets")
+    assert(exhaustionAllocator.allocate(1).isEmpty, "Full pool unexpectedly allocated once")
+    assert(exhaustionAllocator.allocate(1).isEmpty,
+      "Full pool rewound and overlapped a live allocation")
+    exhaustionAllocator.free(16L, 16)
+    assert(exhaustionAllocator.allocate(16).contains(16L),
+      "Explicitly freed range was not reusable")
+    assert(exhaustionAllocator.allocate(1).isEmpty,
+      "Allocator reused a live range after consuming the only freed range")
+
     // Basic boundary test: a slice must not cross the mmap chunk boundary.
     val crossOffset = opts.chunkBytes - 1
     try {

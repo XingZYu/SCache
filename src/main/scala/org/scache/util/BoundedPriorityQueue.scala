@@ -21,7 +21,7 @@ import java.io.Serializable
 import java.util.{PriorityQueue => JPriorityQueue}
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.Growable
+import scala.collection.generic.Growable
 
 /**
  * Bounded priority queue. This class wraps the original PriorityQueue
@@ -37,9 +37,7 @@ private[scache] class BoundedPriorityQueue[A](maxSize: Int)(implicit ord: Orderi
 
   override def size: Int = underlying.size
 
-  override def knownSize: Int = size
-
-  override def addOne(elem: A): this.type = {
+  override def +=(elem: A): this.type = {
     if (size < maxSize) {
       underlying.offer(elem)
     } else {

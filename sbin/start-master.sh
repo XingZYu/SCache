@@ -25,9 +25,9 @@ find_assembly_jar() {
         return 0
     fi
 
-    # Prefer the current scalaVersion (2.13) but fall back to any scala-* directory.
+    # Prefer the Spark 3 / Celeborn-compatible Scala ABI, then fall back to any build.
     local jar
-    jar=$(find "$SCACHE_HOME/target" -type f -path "*/scala-2.13/*" -name "SCache-assembly-*.jar" 2>/dev/null | sort | tail -n 1 || true)
+    jar=$(find "$SCACHE_HOME/target" -type f -path "*/scala-2.12/*" -name "SCache-assembly-*.jar" 2>/dev/null | sort | tail -n 1 || true)
     if [[ -z "$jar" ]]; then
         jar=$(find "$SCACHE_HOME/target" -type f -path "*/scala-*/*" -name "SCache-assembly-*.jar" 2>/dev/null | sort | tail -n 1 || true)
     fi

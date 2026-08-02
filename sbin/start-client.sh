@@ -9,6 +9,7 @@ Usage:
 
 Script options:
   --cpu-node N         Bind client CPU to NUMA node N (uses numactl)
+  --cpu-list LIST      Bind client to an exact physical CPU list (uses numactl)
   --mem-node N         Bind client memory allocations to NUMA node N (uses numactl)
   --numa-node N        Alias for --mem-node
   --numactl-opts OPTS  Raw opts passed to numactl (overrides --cpu-node/--mem-node)
@@ -43,7 +44,7 @@ find_assembly_jar() {
     fi
 
     local jar
-    jar=$(find "$SCACHE_HOME/target" -type f -path "*/scala-2.13/*" -name "SCache-assembly-*.jar" 2>/dev/null | sort | tail -n 1 || true)
+    jar=$(find "$SCACHE_HOME/target" -type f -path "*/scala-2.12/*" -name "SCache-assembly-*.jar" 2>/dev/null | sort | tail -n 1 || true)
     if [[ -z "$jar" ]]; then
         jar=$(find "$SCACHE_HOME/target" -type f -path "*/scala-*/*" -name "SCache-assembly-*.jar" 2>/dev/null | sort | tail -n 1 || true)
     fi
@@ -82,6 +83,7 @@ echo "Starting ScacheClient using $JAR"
 #   ./sbin/start-client.sh --cpu-node 0 --mem-node 1
 CLIENT_ARGS=()
 CPU_NODE="${SCACHE_CLIENT_CPU_NODE:-}"
+CPU_LIST="${SCACHE_CLIENT_CPU_LIST:-}"
 MEM_NODE="${SCACHE_CLIENT_MEM_NODE:-${SCACHE_CLIENT_NUMA_NODE:-}}"
 NUMACTL_OPTS="${SCACHE_CLIENT_NUMACTL_OPTS:-}"
 
@@ -93,6 +95,11 @@ while [[ $# -gt 0 ]]; do
         --cpu-node)
             [[ $# -ge 2 ]] || usage
             CPU_NODE="$2"
+            shift 2
+            ;;
+        --cpu-list)
+            [[ $# -ge 2 ]] || usage
+            CPU_LIST="$2"
             shift 2
             ;;
         --mem-node|--numa-node)
@@ -127,7 +134,9 @@ if [[ -n "${NUMACTL_OPTS}" ]]; then
     CMD_PREFIX=(numactl ${NUMACTL_OPTS})
 else
     NUMA_ARGS=()
-    if [[ -n "${CPU_NODE}" ]]; then
+    if [[ -n "${CPU_LIST}" ]]; then
+        NUMA_ARGS+=(--physcpubind="${CPU_LIST}")
+    elif [[ -n "${CPU_NODE}" ]]; then
         NUMA_ARGS+=(--cpunodebind="${CPU_NODE}")
     fi
     if [[ -n "${MEM_NODE}" ]]; then

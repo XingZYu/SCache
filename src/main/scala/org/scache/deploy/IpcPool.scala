@@ -8,7 +8,7 @@ import java.nio.channels.FileChannel.MapMode
 import java.nio.file.StandardOpenOption
 import java.util
 
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
 private[deploy] final class MmapPoolFile private(
@@ -155,7 +155,6 @@ private[deploy] final class PoolAllocator(
       case None =>
     }
 
-    val originalNext = nextOffset
     var off = nextOffset
 
     val aligned = alignUp(off)
@@ -173,11 +172,13 @@ private[deploy] final class PoolAllocator(
       return Some(off)
     }
 
-    // Wrap-around: add remaining tail as free and retry from free list.
-    if (originalNext < poolSizeBytes) {
-      addFree(originalNext, poolSizeBytes - originalNext)
+    // nextOffset is a high-water mark, not a circular cursor.  Once the virgin portion of the
+    // pool is exhausted, only ranges explicitly returned through free() may be reused.  Resetting
+    // nextOffset to zero here used to allocate over live slices after the first wrap, leaving the
+    // block metadata valid while silently corrupting the bytes underneath it.
+    if (off < poolSizeBytes) {
+      addFree(off, poolSizeBytes - off)
     }
-    nextOffset = 0L
     allocateFromFree(size)
   }
 

@@ -79,7 +79,7 @@ private[scache] class CompactBuffer[T: ClassTag] extends Seq[T] with Serializabl
     this
   }
 
-  def ++= (values: IterableOnce[T]): CompactBuffer[T] = {
+  def ++= (values: TraversableOnce[T]): CompactBuffer[T] = {
     values match {
       // Optimize merging of CompactBuffers, used in cogroup and groupByKey
       case compactBuf: CompactBuffer[T] =>
@@ -103,7 +103,7 @@ private[scache] class CompactBuffer[T: ClassTag] extends Seq[T] with Serializabl
         }
 
       case _ =>
-        values.iterator.foreach(e => this += e)
+        values.toIterator.foreach(e => this += e)
     }
     this
   }

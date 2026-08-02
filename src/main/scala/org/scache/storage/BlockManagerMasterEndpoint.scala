@@ -629,23 +629,21 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
       case None =>
     }
 
-    val originalNext = nextOffset
-    var off = nextOffset
+    val off = alignUp(nextOffset)
 
-    val aligned = alignUp(off)
-    if (aligned > off) insertFree(off, aligned - off)
-    off = aligned
+    if (off > nextOffset) insertFree(nextOffset, off - nextOffset)
 
     if (off + size <= poolSizeBytes) {
       nextOffset = off + size
       return Some(off)
     }
 
-    // Wrap-around: add remaining tail as free and retry from free list.
-    if (originalNext < poolSizeBytes) {
-      insertFree(originalNext, poolSizeBytes - originalNext)
+    // Keep nextOffset as a monotonic high-water mark.  Rewinding it to zero allowed a full CXL
+    // pool to hand out offsets that still belonged to live shuffle blocks.  Reuse is legal only
+    // for ranges that have been explicitly released into the free list.
+    if (off < poolSizeBytes) {
+      insertFree(off, poolSizeBytes - off)
     }
-    nextOffset = 0L
     allocateFromFree(size)
   }
 

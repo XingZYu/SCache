@@ -25,8 +25,8 @@ sbt assembly    # fat jar for deployment
 
 Artifacts:
 
-- `target/scala-2.13/scache_2.13-0.1.0-SNAPSHOT.jar`
-- `target/scala-2.13/SCache-assembly-0.1.0-SNAPSHOT.jar`
+- `target/scala-2.12/scache_2.12-0.1.0-SNAPSHOT.jar`
+- `target/scala-2.12/SCache-assembly-0.1.0-SNAPSHOT.jar`
 
 ### Build Hadoop
 
@@ -42,7 +42,7 @@ mvn package -T 1C -Pdist -DskipTests -Dtar -Dmaven.javadoc.skip=true -Denforcer.
 ```bash
 cd $HOME/spark-3.5
 # Verified 
-./build/sbt -Phadoop-3 -Pscala-2.13 package
+./build/sbt -Phadoop-3 -Pscala-2.12 package
 # Not verified yet
 ./dev/make-distribution.sh -DskipTests
 ```
@@ -70,7 +70,7 @@ sbin/stop-scache.sh
 
 ### Enable in Hadoop MapReduce
 
-- Put `target/scala-2.13/SCache-assembly-0.1.0-SNAPSHOT.jar` on the YARN classpath (for example, copy it to `$HADOOP_HOME/share/hadoop/yarn/lib/` on every node).
+- Put `target/scala-2.12/SCache-assembly-0.1.0-SNAPSHOT.jar` on the YARN classpath (for example, copy it to `$HADOOP_HOME/share/hadoop/yarn/lib/` on every node).
 - Set the following in `$HADOOP_HOME/etc/hadoop/mapred-site.xml`:
 
 ```
@@ -87,7 +87,7 @@ mapreduce.scache.home=$HOME/SCache
 ```
 spark.scache.enable true
 spark.scache.home $HOME/SCache
-spark.scache.jars $HOME/SCache/target/scala-2.13/SCache-assembly-0.1.0-SNAPSHOT.jar
+spark.scache.jars $HOME/SCache/target/scala-2.12/SCache-assembly-0.1.0-SNAPSHOT.jar
 spark.shuffle.useOldFetchProtocol true
 # Optional: bypass Spark shuffle data/index files (store shuffle blocks only in SCache).
 # Requires SCache to be available; consider `scache.daemon.putBlock.async=false` in `conf/scache.conf`.

@@ -152,41 +152,10 @@ public final class Platform {
    */
   @SuppressWarnings("unchecked")
   public static ByteBuffer allocateDirectBuffer(int size) {
-    try {
-      Class<?> cls = Class.forName("java.nio.DirectByteBuffer");
-      Constructor<?> constructor = cls.getDeclaredConstructor(Long.TYPE, Integer.TYPE);
-      constructor.setAccessible(true);
-      Field cleanerField = cls.getDeclaredField("cleaner");
-      cleanerField.setAccessible(true);
-      final long memory = allocateMemory(size);
-      ByteBuffer buffer = (ByteBuffer) constructor.newInstance(memory, size);
-      Runnable cleanup = new Runnable() {
-        @Override
-        public void run() {
-          freeMemory(memory);
-        }
-      };
-
-      // Avoid compile-time dependency on sun.misc.Cleaner / jdk.internal.ref.Cleaner.
-      // Newer JDKs removed sun.misc.Cleaner, and DirectByteBuffer may use an internal Cleaner.
-      try {
-        Class<?> cleanerClass = cleanerField.getType();
-        Method createMethod = cleanerClass.getMethod("create", Object.class, Runnable.class);
-        Object cleaner = createMethod.invoke(null, buffer, cleanup);
-        cleanerField.set(buffer, cleaner);
-      } catch (Throwable ignored) {
-        // Fallback for JDKs where DirectByteBuffer's cleaner field cannot be set.
-        try {
-          java.lang.ref.Cleaner.create().register(buffer, cleanup);
-        } catch (Throwable t) {
-          throwException(t);
-        }
-      }
-      return buffer;
-    } catch (Exception e) {
-      throwException(e);
-    }
-    throw new IllegalStateException("unreachable");
+    // DirectByteBuffer(long, int) was removed in recent JDKs. Let the public
+    // API allocate and register its cleaner; SCache daemons set an explicit
+    // MaxDirectMemorySize large enough for the configured cache.
+    return ByteBuffer.allocateDirect(size);
   }
 
   public static void setMemory(long address, byte value, long size) {
