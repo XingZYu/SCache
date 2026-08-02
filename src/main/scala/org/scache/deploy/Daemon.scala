@@ -291,6 +291,10 @@ class Daemon(
     ret
   }
 
+  def releaseApplication(): Int = {
+    clientRef.askWithRetry[Int](ReleaseApplication(platform))
+  }
+
   def stop(): Unit = {
     rpcEnv.shutdown()
     asyncThreadPool.shutdown()

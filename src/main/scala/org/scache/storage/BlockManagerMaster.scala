@@ -248,6 +248,10 @@ class BlockManagerMaster(
     driverEndpoint.askWithRetry[Boolean](ReleaseCxlBlock(blockId))
   }
 
+  def releaseCxlApplication(appName: String): Int = {
+    driverEndpoint.askWithRetry[Int](ReleaseCxlApplication(appName))
+  }
+
   /** Stop the driver endpoint, called only on the Spark driver node */
   def stop(): Unit = {
     if (driverEndpoint != null && isDriver) {

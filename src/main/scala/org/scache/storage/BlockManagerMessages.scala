@@ -143,4 +143,7 @@ private[scache] object BlockManagerMessages {
   /** Remove a block's shared CXL pool metadata and free the slice (best effort). */
   case class ReleaseCxlBlock(blockId: BlockId) extends ToBlockManagerMaster
 
+  /** Remove every shared CXL allocation owned by an application namespace. */
+  case class ReleaseCxlApplication(appName: String) extends ToBlockManagerMaster
+
 }

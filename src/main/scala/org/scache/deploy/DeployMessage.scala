@@ -38,6 +38,7 @@ private[deploy] object DeployMessages {
   case class RegisterShuffle(appName: String, jobId: Int, ids: Array[Int], numMaps: Array[Int], numReduces: Array[Int]) extends FromDaemon
   case class MapEnd(appName: String, jobId: Int, shuffleId: Int, mapId: Int) extends FromDaemon
   case class GetShuffleStatus(appName: String, jobId: Int, shuffleId: Int) extends FromDaemon
+  case class ReleaseApplication(appName: String) extends FromDaemon
 
   sealed trait  ToDeployClient
   case class RegisterClientSuccess(clientId: Int) extends ToDeployClient

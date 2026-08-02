@@ -320,6 +320,8 @@ class ScacheClient(
           s"Fetch IPC locations for ${blockIds.length} blocks", context) {
         getBlocksIpcFromDaemon(context, blockIds)
       }
+    case ReleaseApplication(appName) =>
+      context.reply(blockManagerMaster.releaseCxlApplication(appName))
     case _ =>
       logError("Empty message received !")
   }

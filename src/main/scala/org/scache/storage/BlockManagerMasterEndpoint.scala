@@ -144,6 +144,9 @@ class BlockManagerMasterEndpoint(
     case ReleaseCxlBlock(blockId) =>
       context.reply(releaseCxlBlock(blockId))
 
+    case ReleaseCxlApplication(appName) =>
+      context.reply(releaseCxlApplication(appName))
+
     case RemoveRdd(rddId) =>
       context.reply(removeRdd(rddId))
 
@@ -200,8 +203,11 @@ class BlockManagerMasterEndpoint(
     if (!cxlSharedEnabled) return false
     if (cxlSharedPoolPath.isEmpty) return false
     if (location.poolPath != cxlSharedPoolPath) return false
-    cxlStateLock.synchronized {
+    val previous = cxlStateLock.synchronized {
       cxlBlocks.put(blockId, location)
+    }
+    previous.filter(_ != location).foreach { old =>
+      cxlAllocator.foreach(_.free(old.offset, old.length))
     }
     true
   }
@@ -221,10 +227,20 @@ class BlockManagerMasterEndpoint(
       }
       i += 1
     }
-    cxlStateLock.synchronized {
+    val previous = cxlStateLock.synchronized {
+      val replaced = new Array[CxlBlockLocation](blockIds.length)
       i = 0
       while (i < blockIds.length) {
-        cxlBlocks.put(blockIds(i), locations(i))
+        replaced(i) = cxlBlocks.put(blockIds(i), locations(i)).orNull
+        i += 1
+      }
+      replaced
+    }
+    cxlAllocator.foreach { allocator =>
+      i = 0
+      while (i < previous.length) {
+        val old = previous(i)
+        if (old != null && old != locations(i)) allocator.free(old.offset, old.length)
         i += 1
       }
     }
@@ -259,6 +275,30 @@ class BlockManagerMasterEndpoint(
       case (None, _) =>
         false
     }
+  }
+
+  private def releaseCxlApplication(appName: String): Int = {
+    if (appName == null || appName.isEmpty || !cxlSharedEnabled) return 0
+    val (removedLocations, poolIsIdle) = cxlStateLock.synchronized {
+      val matches = cxlBlocks.collect {
+        case (bid: ScacheBlockId, loc) if bid.app == appName => (bid, loc)
+      }.toArray
+      matches.foreach { case (bid, _) => cxlBlocks.remove(bid) }
+      (matches.map(_._2), cxlBlocks.isEmpty)
+    }
+    cxlAllocator.foreach { allocator =>
+      if (poolIsIdle) {
+        // Clients reserve large arenas and register only the used sub-ranges. Returning blocks one
+        // by one cannot recover padding and unused arena tails, and leaves the free list too
+        // fragmented to allocate the next arena. Once no live application metadata remains, reset
+        // the allocator atomically so the entire pool is reusable by the next application.
+        allocator.reset()
+      } else {
+        removedLocations.foreach(loc => allocator.free(loc.offset, loc.length))
+      }
+    }
+    logInfo(s"Released ${removedLocations.length} shared CXL blocks for application $appName")
+    removedLocations.length
   }
 
   private def ensurePoolFileSize(path: String, desiredSizeBytes: Long): Long = {
@@ -612,6 +652,11 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
 
   private val free = new JTreeMap[java.lang.Long, java.lang.Long]()
   private var nextOffset = 0L
+
+  def reset(): Unit = synchronized {
+    free.clear()
+    nextOffset = 0L
+  }
 
   private def alignUp(value: Long): Long = {
     val a = alignBytes.toLong
