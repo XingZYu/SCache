@@ -279,6 +279,7 @@ class BlockManagerMasterEndpoint(
 
   private def releaseCxlApplication(appName: String): Int = {
     if (appName == null || appName.isEmpty || !cxlSharedEnabled) return 0
+    val allocatorBefore = cxlAllocator.map(_.snapshot())
     val (removedLocations, poolIsIdle) = cxlStateLock.synchronized {
       val matches = cxlBlocks.collect {
         case (bid: ScacheBlockId, loc) if bid.app == appName => (bid, loc)
@@ -296,6 +297,18 @@ class BlockManagerMasterEndpoint(
       } else {
         removedLocations.foreach(loc => allocator.free(loc.offset, loc.length))
       }
+    }
+    val liveBlocksAfter = cxlStateLock.synchronized(cxlBlocks.size)
+    val allocatorAfter = cxlAllocator.map(_.snapshot())
+    (allocatorBefore, allocatorAfter) match {
+      case (Some(before), Some(after)) =>
+        logInfo(
+          s"""{"event":"ev5_cxl_cleanup","app":"$appName","releasedBlocks":""" +
+            s"""${removedLocations.length},"liveBlocksAfter":$liveBlocksAfter,""" +
+            s""""allocationCount":${after.allocationCount},"freeCount":${after.freeCount},""" +
+            s""""liveBytesBefore":${before.liveBytes},"liveBytesAfter":${after.liveBytes},""" +
+            s""""highWaterBytes":${after.highWaterBytes},"resetCount":${after.resetCount}}""")
+      case _ =>
     }
     logInfo(s"Released ${removedLocations.length} shared CXL blocks for application $appName")
     removedLocations.length
@@ -652,10 +665,28 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
 
   private val free = new JTreeMap[java.lang.Long, java.lang.Long]()
   private var nextOffset = 0L
+  private var allocationCount = 0L
+  private var freeCount = 0L
+  private var liveBytes = 0L
+  private var highWaterBytes = 0L
+  private var resetCount = 0L
+
+  final case class Snapshot(
+      allocationCount: Long,
+      freeCount: Long,
+      liveBytes: Long,
+      highWaterBytes: Long,
+      resetCount: Long)
+
+  def snapshot(): Snapshot = synchronized {
+    Snapshot(allocationCount, freeCount, liveBytes, highWaterBytes, resetCount)
+  }
 
   def reset(): Unit = synchronized {
     free.clear()
     nextOffset = 0L
+    liveBytes = 0L
+    resetCount += 1L
   }
 
   private def alignUp(value: Long): Long = {
@@ -666,7 +697,10 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
 
   def allocate(size: Int): Option[Long] = synchronized {
     if (size < 0) return None
-    if (size == 0) return Some(0L)
+    if (size == 0) {
+      recordAllocation(0)
+      return Some(0L)
+    }
     if (size.toLong > poolSizeBytes) return None
 
     allocateFromFree(size) match {
@@ -680,6 +714,7 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
 
     if (off + size <= poolSizeBytes) {
       nextOffset = off + size
+      recordAllocation(size)
       return Some(off)
     }
 
@@ -710,6 +745,7 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
         if (allocatedEnd < segEnd) {
           free.put(allocatedEnd, segEnd - allocatedEnd)
         }
+        recordAllocation(size)
         return Some(candidate)
       }
 
@@ -719,7 +755,17 @@ private final class CxlPoolAllocator(poolSizeBytes: Long, alignBytes: Int) {
   }
 
   def free(offset: Long, size: Int): Unit = synchronized {
-    insertFree(offset, size.toLong)
+    if (size > 0 && offset >= 0 && offset + size <= poolSizeBytes) {
+      insertFree(offset, size.toLong)
+      freeCount += 1L
+      liveBytes = Math.max(0L, liveBytes - size.toLong)
+    }
+  }
+
+  private def recordAllocation(size: Int): Unit = {
+    allocationCount += 1L
+    liveBytes += size.toLong
+    highWaterBytes = Math.max(highWaterBytes, liveBytes)
   }
 
   private def insertFree(offset: Long, length: Long): Unit = {
