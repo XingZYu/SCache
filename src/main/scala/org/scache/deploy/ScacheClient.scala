@@ -7,7 +7,7 @@ import java.nio.channels.FileChannel
 import java.nio.channels.FileChannel.MapMode
 import java.nio.file.StandardOpenOption
 import java.util.UUID
-import java.util.concurrent.{TimeoutException, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, Semaphore, TimeoutException, TimeUnit}
 
 import org.apache.commons.httpclient.util.TimeoutController.TimeoutException
 import org.scache.deploy.DeployMessages._
@@ -24,7 +24,7 @@ import org.scache.util._
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration.Duration
-import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutorService, Future}
+import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutorService, Future, Promise}
 import scala.util.control.Exception
 import scala.util.{Failure, Random, Success}
 
@@ -75,6 +75,24 @@ class ScacheClient(
   // For single-node CXL emulation testing only.
   private val cxlSharedForce =
     conf.getBoolean("scache.storage.cxl.shared.force", false)
+
+  // UB distributed shared arena is deliberately independent from the CXL-like mmap pool.  A
+  // reducer receives only a local destination slice; the owner path is never treated as a remote
+  // filesystem path.
+  private lazy val ubSharedPoolEnabled =
+    conf.getBoolean("scache.ub.pool.enabled", false)
+  private lazy val ubSharedPoolStrict =
+    conf.getBoolean("spark.scache.strict", false) ||
+      conf.getBoolean("spark.urma.strict", false)
+  // A previous experiment changed GetBlocksIpc to unbounded Future.traverse. That allowed two
+  // requests for the same logical block to reserve/commit the same arena entry concurrently.
+  // Keep the safe serial default for all other backends, and use a small bounded degree only for
+  // the UB pool path. The single-flight table makes duplicate block ids share one fetch.
+  private lazy val ubPoolFetchParallelism =
+    math.max(1, conf.getInt("scache.ub.pool.fetchParallelism", 4))
+  private lazy val ubPoolFetchSlots = new Semaphore(ubPoolFetchParallelism)
+  private lazy val ubPoolFetches =
+    new ConcurrentHashMap[String, Future[Option[IpcBlock]]]()
 
   @volatile private var poolAllocator: PoolAllocator = null
   @volatile private var poolFile: MmapPoolFile = null
@@ -237,6 +255,16 @@ class ScacheClient(
       throw new IllegalArgumentException(s"Unsupported scache.blockTransfer.backend=$other")
   }
 
+  private def ubSharedTransport: Option[org.scache.network.ub.UBBlockTransferService] = {
+    if (!ubSharedPoolEnabled) None
+    else blockTransferService match {
+      case ub: org.scache.network.ub.UBBlockTransferService => Some(ub)
+      case _ =>
+        throw new IllegalStateException(
+          "scache.ub.pool.enabled=true requires scache.blockTransfer.backend=ub")
+    }
+  }
+
 
   val blockManagerMasterEndpoint = RpcUtils.makeDriverRef(BlockManagerMaster.DRIVER_ENDPOINT_NAME, conf, rpcEnv)
   val blockManagerMaster = new BlockManagerMaster(blockManagerMasterEndpoint, conf, false)
@@ -320,6 +348,10 @@ class ScacheClient(
           case _ => None
         }
       }
+    case AbortPutBlock(blockId, size, ipc) =>
+      doAsync[Boolean](s"Abort block reservation $blockId from daemon", context) {
+        abortPutBlockFromDaemon(blockId, size, ipc)
+      }
     case PutBlock(blockId, size, ipc) =>
       doAsync[Boolean](s"Read block $blockId from daemon", context) {
         readBlockFromDaemon(context, blockId, size, ipc)
@@ -359,13 +391,28 @@ class ScacheClient(
       }
     case GetBlockIpc(blockId) =>
       doAsync[Option[IpcBlock]](s"Fetch IPC location for block ${blockId} from daemon", context) {
-        getBlockIpcFromDaemon(context, blockId)
+        if (ubSharedPoolEnabled) {
+          Await.result(ubPoolFetchSingleFlight(context, blockId), Duration.Inf)
+        } else {
+          getBlockIpcFromDaemon(context, blockId)
+        }
       }
     case GetBlocksIpc(blockIds) =>
       doAsync[Seq[Option[IpcBlock]]](s"Fetch IPC locations for ${blockIds.size} blocks from daemon", context) {
-        blockIds.map { blockId =>
-          getBlockIpcFromDaemon(context, blockId)
+        if (ubSharedPoolEnabled) {
+          // Different blocks can make progress concurrently, but the semaphore bounds URMA and
+          // arena/control pressure. Duplicate logical block ids are coalesced by single-flight.
+          Await.result(Future.traverse(blockIds)(blockId =>
+            ubPoolFetchSingleFlight(context, blockId)), Duration.Inf)
+        } else {
+          blockIds.map { blockId =>
+            getBlockIpcFromDaemon(context, blockId)
+          }
         }
+      }
+    case ReleaseImportedBlock(blockId) =>
+      doAsync[Boolean](s"Release imported UB pool block ${blockId}", context) {
+        ubSharedPoolEnabled && ubSharedTransport.exists(_.releaseImportedPoolBlock(blockId))
       }
     case _ =>
       logError("Empty message received !")
@@ -418,6 +465,35 @@ class ScacheClient(
     val localConsumer = isLocalConsumer(blockId)
     val storageLevel =
       if (localConsumer) daemonPutStorageLevelLocal else daemonPutStorageLevelRemote
+
+    // UB pool commit publishes the bytes already written by Spark into a long-lived registered
+    // arena.  Do not materialize them into BlockManager memory; only register a directory/status
+    // entry so reducers can discover the owner BlockManagerId.
+    ipc match {
+      case IpcPoolSlice(poolPath, offset, length) if ubSharedPoolEnabled =>
+        val ub = ubSharedTransport.get
+        if (length != size || offset < 0L) {
+          logError(s"UB pool slice mismatch block=$blockId size=$size offset=$offset length=$length")
+          return false
+        }
+        try {
+          val committed = ub.commitPoolBlock(blockId, poolPath, offset, size)
+          if (!committed) return false
+          val registered = blockManager.registerExternalBlock(
+            blockId, size, StorageLevel.MEMORY_ONLY, tellMaster = true)
+          if (!registered) {
+            ub.unpublishBlock(blockId)
+          }
+          return registered
+        } catch {
+          case e: Exception =>
+            try ub.unpublishBlock(blockId) catch { case _: Exception => }
+            logError(s"Failed to commit UB shared pool block $blockId", e)
+            if (ubSharedPoolStrict) throw e
+            return false
+        }
+      case _ =>
+    }
 
     ipc match {
       case IpcPoolSlice(poolPath0, offset, _) if (!localConsumer || cxlSharedForce) &&
@@ -516,6 +592,19 @@ class ScacheClient(
   private def preparePutBlockFromDaemon(blockId: BlockId, size: Int): IpcLocation = {
     if (size < 0) return IpcFile("")
 
+    if (ubSharedPoolEnabled) {
+      val ub = ubSharedTransport.get
+      ub.preparePoolBlock(blockId, size) match {
+        case Some(slice) =>
+          return IpcPoolSlice(slice.path, slice.offset, slice.length)
+        case None =>
+          if (ubSharedPoolStrict) {
+            throw new IllegalStateException(
+              s"UB shared pool is enabled but could not reserve block=$blockId size=$size")
+          }
+      }
+    }
+
     if (ipcBackend == "pool") {
       val useSharedCxlPool =
         cxlSharedEnabled && cxlSharedPoolPath.nonEmpty &&
@@ -590,9 +679,36 @@ class ScacheClient(
     }
   }
 
+  /** Release a writer-side UB reservation without publishing a block location. */
+  private def abortPutBlockFromDaemon(
+      blockId: BlockId, size: Int, ipc: IpcLocation): Boolean = {
+    ipc match {
+      case IpcPoolSlice(poolPath, offset, length) if ubSharedPoolEnabled =>
+        if (size < 0 || length != size || offset < 0L) {
+          throw new IllegalArgumentException(
+            s"Invalid UB pool abort slice block=$blockId size=$size offset=$offset length=$length")
+        }
+        ubSharedTransport.get.abortPoolBlock(blockId, poolPath, offset, size)
+      case _ =>
+        // Existing file/CXL paths have their own commit-time ownership rules.  The new abort
+        // message is intentionally a no-op for them so enabling this cleanup hook does not
+        // change baseline behavior.
+        true
+    }
+  }
+
   /** Batch allocate CXL pool slices: one RPC to Master for all blocks. */
   def preparePutBlocksFromDaemon(blockIds: Seq[BlockId], sizes: Seq[Int]): Seq[IpcLocation] = {
     require(blockIds.size == sizes.size, s"blockIds.size=${blockIds.size} != sizes.size=${sizes.size}")
+    if (ubSharedPoolEnabled) {
+      val ub = ubSharedTransport.get
+      return ub.preparePoolBlocks(blockIds, sizes).map {
+        case Some(slice) => IpcPoolSlice(slice.path, slice.offset, slice.length)
+        case None if ubSharedPoolStrict =>
+          throw new IllegalStateException("UB shared pool batch reservation failed")
+        case None => IpcFile("")
+      }
+    }
     if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty) {
       val locs = blockManagerMaster.reserveCxlBlocks(blockIds, "", sizes.toSeq)
       return locs.zip(sizes).map {
@@ -736,6 +852,39 @@ class ScacheClient(
   private def getBlockIpcFromDaemon(context: RpcCallContext, blockId: BlockId): Option[IpcBlock] = {
     if (blockId == null) return None
 
+    if (ubSharedPoolEnabled) {
+      val ub = ubSharedTransport.get
+      ub.localPoolBlock(blockId) match {
+        case Some(slice) =>
+          return Some(IpcBlock(slice.length,
+            IpcPoolSlice(slice.path, slice.offset, slice.length)))
+        case None =>
+      }
+
+      // The BlockManager master directory tells us which UB control endpoint owns the block.  A
+      // successful fetch is cached in this executor's local arena; subsequent Spark reads use the
+      // local slice and do not repeat URMA READ.
+      val localId = blockManager.blockManagerId
+      val locations = blockManagerMaster.getLocations(blockId)
+      locations.iterator.filterNot(_ == localId).foreach { location =>
+        try {
+          ub.fetchBlockToPool(location.host, location.port, blockId.toString) match {
+            case Some(slice) =>
+              return Some(IpcBlock(slice.length,
+                IpcPoolSlice(slice.path, slice.offset, slice.length)))
+            case None =>
+          }
+        } catch {
+          case e: Exception =>
+            logWarning(s"UB shared pool fetch failed block=$blockId source=$location", e)
+        }
+      }
+      if (ubSharedPoolStrict) {
+        throw new IllegalStateException(
+          s"Strict UB shared pool could not fetch block=$blockId from ${locations.mkString(",")}")
+      }
+    }
+
     if (cxlSharedEnabled && cxlSharedPoolPath.nonEmpty) {
       try {
         blockManagerMaster.getCxlBlock(blockId) match {
@@ -821,6 +970,40 @@ class ScacheClient(
     val statuses = getShuffleStatus(ScacheBlockId("scache", 0, 1, 0, 0))
     for (rs <- statuses.reduceArray) {
       logInfo(s"TEST: shuffle status of ${statuses.shffleId}: reduce ${rs.id} on ${rs.host}")
+    }
+  }
+
+  /**
+   * Coalesce concurrent requests for one logical block while allowing a bounded number of
+   * different UB pool blocks to fetch concurrently. The promise is installed before the
+   * worker starts, so retries/duplicate GetBlocksIpc entries cannot reserve the same slice twice.
+   */
+  private def ubPoolFetchSingleFlight(
+      context: RpcCallContext, blockId: BlockId): Future[Option[IpcBlock]] = {
+    val key = if (blockId == null) "<null>" else blockId.toString
+    val ub = ubSharedTransport.get
+    // Reserve before joining a completed single-flight Future. The reservation transfers to
+    // Spark's ManagedBuffer release callback; failed or missing fetches cancel it here.
+    ub.reservePoolConsumer(blockId)
+    val promise = Promise[Option[IpcBlock]]()
+    val existing = ubPoolFetches.putIfAbsent(key, promise.future)
+    val shared =
+      if (existing != null) {
+        existing
+      } else {
+        Future {
+          ubPoolFetchSlots.acquire()
+          try getBlockIpcFromDaemon(context, blockId)
+          finally ubPoolFetchSlots.release()
+        }.onComplete { result =>
+          promise.tryComplete(result)
+          ubPoolFetches.remove(key, promise.future)
+        }
+        promise.future
+      }
+    shared.andThen {
+      case Success(Some(_)) =>
+      case _ => ub.cancelPoolConsumer(blockId)
     }
   }
 

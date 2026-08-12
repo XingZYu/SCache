@@ -14,6 +14,15 @@ if(NOT URMA_ROOT)
     message(FATAL_ERROR "Set OU_UMDK_BUILD or -DURMA_ROOT to the built UMDK tree")
 endif()
 
+# The openurma_vdev provider exposes the registered-MR token/generation through
+# its optional q5-compatible diagnostic ABI. The transport source deliberately
+# uses __has_include so it can still build against a generic UMDK, but a native
+# vdev build must add the provider header directory explicitly. Keep this
+# optional: official UMDK builds that do not ship the project provider must not
+# fail merely because the diagnostic ABI is unavailable.
+set(OPENURMA_VDEV_INCLUDE "$ENV{OPENURMA_VDEV_INCLUDE}" CACHE PATH
+    "openurma_vdev provider headers (optional)")
+
 set(URMA_VENDOR "${URMA_ROOT}/../../vendor/umdk/src/urma")
 find_path(URMA_INC urma_api.h
     HINTS "$ENV{OU_UMDK_INCLUDE}" "${URMA_VENDOR}/lib/urma/core/include"
@@ -57,6 +66,12 @@ target_include_directories(spark_urma_obj PRIVATE
     ${URMA_COMMON_INC}
     ${JNI_INCLUDE_DIRS}
 )
+if(OPENURMA_VDEV_INCLUDE AND EXISTS "${OPENURMA_VDEV_INCLUDE}/openurma_vdev_q5.h")
+    target_include_directories(spark_urma_obj PRIVATE ${OPENURMA_VDEV_INCLUDE})
+    message(STATUS "openurma_vdev MR ABI enabled from ${OPENURMA_VDEV_INCLUDE}")
+else()
+    message(STATUS "openurma_vdev MR ABI disabled (provider header not found)")
+endif()
 target_compile_features(spark_urma_obj PUBLIC cxx_std_17)
 target_compile_options(spark_urma_obj PRIVATE -Wall -Wextra -Werror)
 set_target_properties(spark_urma_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -75,6 +90,9 @@ add_library(SparkUrma SHARED
 )
 target_include_directories(SparkUrma PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC} ${URMA_COMMON_INC} ${JNI_INCLUDE_DIRS})
+if(OPENURMA_VDEV_INCLUDE AND EXISTS "${OPENURMA_VDEV_INCLUDE}/openurma_vdev_q5.h")
+    target_include_directories(SparkUrma PRIVATE ${OPENURMA_VDEV_INCLUDE})
+endif()
 target_compile_features(SparkUrma PRIVATE cxx_std_17)
 target_compile_options(SparkUrma PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(SparkUrma PRIVATE

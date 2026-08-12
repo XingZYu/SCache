@@ -100,6 +100,23 @@ private[scache] class BlockManager(
   private[scache] val diskStore = new DiskStore(conf, diskBlockManager)
   memoryManager.setMemoryStore(memoryStore)
 
+  // Metadata-only blocks whose payload is owned by the UB transport pool. Keep both the feature
+  // flag and its index lazy so non-UB backends do not allocate or access UB-only state.
+  private lazy val ubSharedPoolEnabled =
+    conf.getBoolean("scache.ub.pool.enabled", false)
+  private lazy val externalBlockSizes = mutable.HashMap.empty[BlockId, Long]
+
+  private def getExternalBlockSize(blockId: BlockId): Option[Long] = {
+    if (!ubSharedPoolEnabled) None
+    else externalBlockSizes.synchronized { externalBlockSizes.get(blockId) }
+  }
+
+  private def removeExternalBlockSize(blockId: BlockId): Unit = {
+    if (ubSharedPoolEnabled) {
+      externalBlockSizes.synchronized { externalBlockSizes.remove(blockId) }
+    }
+  }
+
   // Note: depending on the memory manager, `maxMemory` may actually vary over time.
   // However, since we use this only for reporting and logging, what we actually want here is
   // the absolute maximum value that `maxMemory` can ever possibly reach. We may need
@@ -358,9 +375,13 @@ private[scache] class BlockManager(
    */
   def getStatus(blockId: BlockId): Option[BlockStatus] = {
     blockInfoManager.get(blockId).map { info =>
-      val memSize = if (memoryStore.contains(blockId)) memoryStore.getSize(blockId) else 0L
-      val diskSize = if (diskStore.contains(blockId)) diskStore.getSize(blockId) else 0L
-      BlockStatus(info.level, memSize = memSize, diskSize = diskSize)
+      getExternalBlockSize(blockId) match {
+        case Some(size) => BlockStatus(info.level, memSize = size, diskSize = 0L)
+        case None =>
+          val memSize = if (memoryStore.contains(blockId)) memoryStore.getSize(blockId) else 0L
+          val diskSize = if (diskStore.contains(blockId)) diskStore.getSize(blockId) else 0L
+          BlockStatus(info.level, memSize = memSize, diskSize = diskSize)
+      }
     }
   }
 
@@ -471,6 +492,11 @@ private[scache] class BlockManager(
    * and the updated in-memory and on-disk sizes.
    */
   private def getCurrentBlockStatus(blockId: BlockId, info: BlockInfo): BlockStatus = {
+    getExternalBlockSize(blockId) match {
+      case Some(size) =>
+        return BlockStatus(info.level, memSize = size, diskSize = 0L)
+      case None =>
+    }
     info.synchronized {
       info.level match {
         case null =>
@@ -962,6 +988,41 @@ private[scache] class BlockManager(
       tellMaster: Boolean = true): Boolean = {
     require(bytes != null, "Bytes is null")
     doPutBytes(blockId, bytes, level, implicitly[ClassTag[T]], tellMaster)
+  }
+
+  /**
+   * Register a block whose bytes are owned by an external transport pool.
+   *
+   * UB shared-pool blocks are already resident in a long-lived registered arena.  Calling
+   * putBytes for them would materialize/copy the payload into MemoryStore and then publish a
+   * second UB copy.  This method creates only the BlockInfo/master directory entry; the UB
+   * transport owns the bytes and removes them from the arena during removeBlock/application
+   * cleanup.  It deliberately reports an in-memory status so the normal location protocol can
+   * advertise the BlockManager as the owner without pretending that MemoryStore contains a copy.
+   */
+  private[scache] def registerExternalBlock(
+      blockId: BlockId,
+      size: Int,
+      level: StorageLevel = StorageLevel.MEMORY_ONLY,
+      tellMaster: Boolean = true): Boolean = {
+    require(size >= 0, s"External block size must be non-negative: $blockId/$size")
+    require(ubSharedPoolEnabled,
+      "External blocks require scache.ub.pool.enabled=true")
+    doPut[Any](blockId, level, ClassTag.Any, tellMaster = tellMaster, keepReadLock = false) { info =>
+      info.size = size
+      info.level = level
+      externalBlockSizes.synchronized { externalBlockSizes.put(blockId, size.toLong) }
+      if (tellMaster) {
+        try {
+          reportBlockStatus(blockId, info, BlockStatus(level, memSize = size.toLong, diskSize = 0L))
+        } catch {
+          case t: Throwable =>
+            removeExternalBlockSize(blockId)
+            throw t
+        }
+      }
+      None
+    }.isEmpty
   }
 
   /**
@@ -1622,6 +1683,11 @@ private[scache] class BlockManager(
       }
       .distinct
     blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster = false) }
+    blockTransferService match {
+      case ub: org.scache.network.ub.UBBlockTransferService =>
+        ub.releaseCachedRemoteImportsForShuffle(appName, shuffleId, jobId)
+      case _ =>
+    }
     if (blocksToRemove.nonEmpty) {
       logInfo(s"SCACHE_RECLAIM_SHUFFLE app=$appName jobId=$jobId " +
         s"shuffleId=$shuffleId blocks=${blocksToRemove.size}")
@@ -1675,6 +1741,7 @@ private[scache] class BlockManager(
           case ub: org.scache.network.ub.UBBlockTransferService => ub.unpublishBlock(blockId)
           case _ =>
         }
+        removeExternalBlockSize(blockId)
         if (!diskStore.remove(blockId)) {
           logDebug(s"Asked to remove block $blockId, which does not exist")
         }
@@ -1694,6 +1761,7 @@ private[scache] class BlockManager(
             "the disk, memory, or external block store")
         }
         blockInfoManager.removeBlock(blockId)
+        removeExternalBlockSize(blockId)
         val removeBlockStatus = getCurrentBlockStatus(blockId, info)
         if (tellMaster && info.tellMaster) {
           reportBlockStatus(blockId, info, removeBlockStatus)

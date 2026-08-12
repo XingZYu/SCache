@@ -40,11 +40,15 @@ private[deploy] object DeployMessages {
   sealed trait FromDaemon
   case class PreparePutBlock(scacheBlockId: BlockId, size: Int) extends FromDaemon
   case class PreparePutBlocks(scacheBlockIds: Seq[BlockId], sizes: Seq[Int]) extends FromDaemon
+  case class AbortPutBlock(scacheBlockId: BlockId, size: Int, ipc: IpcLocation) extends FromDaemon
   case class PutBlock(scacheBlockId: BlockId, size: Int, ipc: IpcLocation) extends FromDaemon
   case class PutBlocks(msgs: Seq[PutBlock]) extends FromDaemon
   case class GetBlock(scacheBlockId: BlockId) extends FromDaemon
   case class GetBlockIpc(scacheBlockId: BlockId) extends FromDaemon
   case class GetBlocksIpc(scacheBlockIds: Seq[BlockId]) extends FromDaemon
+  // Reducer-side pool slices are transient destinations. Spark sends this after the
+  // corresponding ManagedBuffer has been consumed so the arena can be reused immediately.
+  case class ReleaseImportedBlock(scacheBlockId: BlockId) extends FromDaemon
   case class RegisterShuffle(appName: String, jobId: Int, ids: Array[Int], numMaps: Array[Int], numReduces: Array[Int]) extends FromDaemon
   // A shuffle id is only unique within a Spark application lifetime.  Include
   // the Spark job id so job-end cleanup cannot remove a later job's blocks that

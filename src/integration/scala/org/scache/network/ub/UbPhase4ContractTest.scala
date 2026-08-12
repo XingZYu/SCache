@@ -8,9 +8,9 @@ private[scache] object UbPhase4ContractTest {
       throw new IllegalArgumentException("OPENURMA_WIRE_ROLE is required"))
     val requestedRole = args.lift(1).getOrElse(role)
     val protocol = UBBlockTransferService.runProtocolContracts()
-    var transport: UrmaTransport = null
+    var transport: UbTransport = null
     val arena = try {
-      transport = UrmaTransport.open(device, 32, 4096, true, requestedRole)
+      transport = RealUbTransport.open(device, 32, 4096, true, requestedRole)
       UBBlockTransferService.runArenaContracts(transport)
     } finally if (transport != null) transport.close()
     val all = protocol.map { case (name, ok) => ("protocol", name, ok) } ++

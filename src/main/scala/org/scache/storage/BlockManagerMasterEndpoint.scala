@@ -57,6 +57,13 @@ class BlockManagerMasterEndpoint(
   private val blockLocations = new JHashMap[BlockId, mutable.HashSet[BlockManagerId]]
   private val prefetchSequence = new AtomicLong(0L)
   private val prefetchResults = new mutable.ArrayBuffer[PrefetchResult]()
+  // UB shared-pool reducers fetch the published arena slice through the ranged URMA
+  // path. The legacy map-completion prefetch below materializes a byte[] and calls
+  // putBytes for the same block; with the direct pool path that races the reducer
+  // lookup and can publish the same logical block twice. Keep legacy prefetch for
+  // Netty/CXL, but disable it for the UB pool backend where it is redundant and adds
+  // an avoidable copy.
+  private val ubSharedPoolEnabled = conf.getBoolean("scache.ub.pool.enabled", false)
 
   // Shared CXL (fsdax) pool metadata: block -> (poolPath, offset, length).
   private val cxlSharedEnabled =
@@ -761,7 +768,8 @@ class BlockManagerMasterEndpoint(
       locations = new mutable.HashSet[BlockManagerId]
       blockLocations.put(blockId, locations)
       // update block status in mapoutputtracker, it may trigger the map pre-fetch
-      if (mapOutputTrackerMaster.updateMapBlocksStatus(blockId) == 0) {
+      val mapComplete = mapOutputTrackerMaster.updateMapBlocksStatus(blockId) == 0
+      if (mapComplete && !ubSharedPoolEnabled) {
         val sbId = blockId.asInstanceOf[ScacheBlockId]
         val correlationId = s"prefetch-${sbId.app}-${sbId.jobId}-${sbId.shuffleId}-" +
           s"${sbId.mapId}-${prefetchSequence.incrementAndGet()}"

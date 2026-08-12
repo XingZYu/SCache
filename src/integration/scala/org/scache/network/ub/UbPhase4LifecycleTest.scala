@@ -14,16 +14,19 @@ private[scache] object UbPhase4LifecycleTest {
     val rssKb = (0 until status.size()).map(status.get).find(_.startsWith("VmRSS:"))
       .flatMap(_.split("\\s+").lift(1)).map(_.toLong).getOrElse(-1L)
     val native = arena.transportMetrics
+    def backend(name: String): Long = Option(native.backendCounters.get(name))
+      .map(_.longValue()).getOrElse(0L)
     println(s"RESOURCE round=$round fd=$fdCount threads=${Thread.getAllStackTraces.size()} " +
       s"vmRssKb=$rssKb usedHeap=${runtime.totalMemory - runtime.freeMemory} freeBytes=${arena.freeBytes} " +
       s"published=${arena.publishedBlocks} leases=${arena.activeLeases} scratch=${arena.activeScratch} " +
-      s"regions=${native.activeRegions} imports=${native.activeImports} transports=${native.activeTransports} " +
-      s"providerOutstanding=${native.providerOutstandingRequests}")
+      s"regions=${native.registeredRegions} imports=${backend("activeImports")} " +
+      s"transports=${backend("activeTransports")} " +
+      s"providerOutstanding=${backend("providerOutstandingRequests")}")
   }
   def main(args: Array[String]): Unit = {
     val device = args.headOption.getOrElse("openurma0")
     val role = Option(System.getenv("OPENURMA_WIRE_ROLE")).getOrElse("listen")
-    val transport = UrmaTransport.open(device, 64, 4096, true, role)
+    val transport = RealUbTransport.open(device, 64, 4096, true, role)
     val arena = new UBBlockTransferService.RegisteredArena(transport, 1024 * 1024, "lifecycle", 1L)
     try {
       sample(0, arena)

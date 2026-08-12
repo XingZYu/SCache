@@ -362,7 +362,9 @@ RegisteredRegion UrmaTransport::register_region(void* address, size_t length) {
 #if defined(SPARK_URMA_HAS_VDEV_MR_INFO)
     spark_openurma_vdev_mr_resp mr_info = {};
     const auto mr_info_fn = resolve_vdev_mr_info();
+    bool vdev_mr_info_valid = false;
     if (mr_info_fn != nullptr && mr_info_fn(segment, &mr_info) == 0) {
+        vdev_mr_info_valid = true;
         region.generation = mr_info.generation;
         std::fprintf(stderr, "SPARK_URMA_MR ctx_eid=%02x%02x%02x%02x seg_eid=%02x%02x%02x%02x eid_index=%u token=%u gen=%llu\n",
                      ((unsigned char*)&ctx_->eid)[0], ((unsigned char*)&ctx_->eid)[1], ((unsigned char*)&ctx_->eid)[2], ((unsigned char*)&ctx_->eid)[3],
@@ -378,7 +380,16 @@ RegisteredRegion UrmaTransport::register_region(void* address, size_t length) {
         local_ep_.segment_generation = mr_info.generation;
     }
 #endif
+#if defined(SPARK_URMA_HAS_VDEV_MR_INFO)
+    // Q8 uses eid_index=0 as a valid device-local segment identity.  Do not
+    // treat zero as "missing" and replace it with the public ubva.uasid
+    // (typically 4096); that value is not accepted by the provider's MR
+    // lookup and makes every remote READ complete with REM_ACCESS_ABORT.
+    if (!vdev_mr_info_valid && local_ep_.segment_uasid == 0)
+        local_ep_.segment_uasid = segment->seg.ubva.uasid;
+#else
     if (local_ep_.segment_uasid == 0) local_ep_.segment_uasid = segment->seg.ubva.uasid;
+#endif
     region.owner_epoch = owner_epoch_;
     LocalRegionState state;
     state.region = region;
@@ -430,6 +441,18 @@ void UrmaTransport::unregister_region(uint64_t handle) {
 
 void UrmaTransport::release_cached_remote_imports() {
     LOCK();
+    // A provider CQE can arrive after the API-level request has become terminal.
+    // Drain those late completions before unimporting peer segments; otherwise cleanup
+    // races the provider and returns ERR_BUSY even though transport inflight is zero.
+    const auto drain_deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::min<uint32_t>(std::max<uint32_t>(1, options_.request_timeout_ms), 5000));
+    while (metrics_.provider_outstanding_requests.load() != 0 &&
+           std::chrono::steady_clock::now() < drain_deadline) {
+        poll_once_locked();
+        if (metrics_.provider_outstanding_requests.load() != 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
     if (metrics_.provider_outstanding_requests.load() != 0) {
         throw std::runtime_error(
             "ERR_BUSY: provider requests are outstanding while releasing remote imports");

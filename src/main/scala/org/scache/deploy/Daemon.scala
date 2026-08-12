@@ -237,6 +237,19 @@ class Daemon(
   }
 
   /**
+   * Release a pool reservation when the Spark writer aborts before commit.  The payload is not
+   * copied and no block-directory entry is created by this message.
+   */
+  def abortPutBlockPool(blockId: String, size: Int, poolPath: String, offset: Long): Boolean = {
+    val scacheBlockId = BlockId.apply(blockId)
+    val resolvedPoolPath = if (poolPath != null && poolPath.nonEmpty) poolPath else ipcPoolPath
+    askClient[Boolean]("abort-put-pool", AbortPutBlock(
+      scacheBlockId,
+      size,
+      IpcPoolSlice(resolvedPoolPath, offset, size)))
+  }
+
+  /**
    * Publish a previously prepared generic IPC location as the final contents of the given block.
    */
   def commitPutBlock(blockId: String, size: Int, ipc: IpcLocation): Boolean = {
@@ -306,7 +319,20 @@ class Daemon(
 
     val specsArr = validSpecs.result()
     if (specsArr.nonEmpty) {
-      val commits = commitPutBlocksPool(specsArr.toIndexedSeq)
+      // A task attempt can fail after PREPARE (or after a partial COMMIT).  Return every
+      // reservation that did not reach a successful commit before Spark retries the task; without
+      // this, the next attempt sees the same logical block id and the arena keeps a stale lease.
+      def abortSpec(spec: (String, Int, IpcPoolSlice)): Unit = {
+        try abortPutBlockPool(spec._1, spec._2, spec._3.poolPath, spec._3.offset)
+        catch { case NonFatal(e) => logWarning(s"Failed to abort pool reservation ${spec._1}", e) }
+      }
+      val commits = try {
+        commitPutBlocksPool(specsArr.toIndexedSeq)
+      } catch {
+        case NonFatal(e) =>
+          specsArr.foreach(abortSpec)
+          throw e
+      }
       // Map commit results back to original indices for pool-slice blocks
       var commitIdx = 0
       i = 0
@@ -315,6 +341,7 @@ class Daemon(
           if (!commits(commitIdx)) {
             results(i) = false
             logWarning(s"Batch commit failed for block ${scacheBlockIds(i)}")
+            abortSpec(specsArr(commitIdx))
           }
           commitIdx += 1
         }
@@ -448,6 +475,17 @@ class Daemon(
     if (scacheBlockIds.isEmpty) return Seq.empty
     askClient[Seq[Option[IpcBlock]]]("get-ipc-batch", GetBlocksIpc(scacheBlockIds))
   }
+
+  /**
+   * Release only a reducer-imported UB destination slice. Owner blocks are deliberately a no-op:
+   * their lifetime remains shuffle-scoped and they may still be needed by another reducer.
+   */
+  def releaseImportedBlock(blockId: String): Boolean = {
+    val parsed = BlockId.apply(blockId)
+    if (!parsed.isInstanceOf[ScacheBlockId]) return false
+    askClient[Boolean]("release-imported-block", ReleaseImportedBlock(parsed))
+  }
+
   def registerShuffles(jobId: Int, shuffleIds: Array[Int], maps: Array[Int], reduces: Array[Int]): Unit = {
     // Registration must be synchronous to ensure the shuffle is registered before returning.
     // Using doAsync here causes a race condition where tasks may try to read shuffle data

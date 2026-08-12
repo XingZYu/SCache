@@ -41,6 +41,8 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
       ubDevice: String = "",
       arenaBytes: Int = 0,
       arenaCount: Int = 2,
+      queueDepth: Int = 128,
+      chunkSize: Int = 4096,
       leaseTimeoutMs: Int = 60000,
       testReadDelayMs: Int = 0,
       timeoutMs: Long = 30000L)
@@ -76,6 +78,14 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
       }
       if (options.arenaBytes > 0) conf.set("spark.urma.arenaBytes", options.arenaBytes.toString, slient = true)
       conf.set("spark.urma.arenaCount", options.arenaCount.toString, slient = true)
+      // These values must be applied to the SCache client itself. Spark executor
+      // --conf values only configure the Spark-side transport; without copying them
+      // here the client silently retained the historical 4 KiB default while the
+      // executor advertised a larger operation, causing avoidable fragmentation.
+      require(options.queueDepth > 0, "--queue-depth must be positive")
+      require(options.chunkSize > 0, "--chunk-size must be positive")
+      conf.set("spark.urma.queueDepth", options.queueDepth.toString, slient = true)
+      conf.set("spark.urma.chunkSize", options.chunkSize.toString, slient = true)
       conf.set("spark.urma.leaseTimeoutMs", options.leaseTimeoutMs.toString, slient = true)
       conf.set("spark.urma.testReadDelayMs", options.testReadDelayMs.toString, slient = true)
       conf.set("spark.urma.transferTimeoutMs", options.timeoutMs.toString, slient = true)
@@ -104,7 +114,9 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     println(s"SCACHE_TEST_NODE_READY name=${options.name} pid=$pid clientId=${endpoint.clientId} " +
       s"rpc=${options.host}:${options.rpcPort} control=${options.host}:${options.controlPort} " +
       s"blockManagerId=${endpoint.blockManager.blockManagerId} backend=$backend " +
-      s"networkEnabled=$networkEnabled sharedCxl=$sharedCxl")
+      s"networkEnabled=$networkEnabled sharedCxl=$sharedCxl " +
+      s"urmaQueueDepth=${conf.getInt("spark.urma.queueDepth", 128)} " +
+      s"urmaChunkSize=${conf.getInt("spark.urma.chunkSize", 4096)}")
     System.out.flush()
 
     try {
@@ -382,12 +394,17 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     case "--master-host" :: value :: tail => parseArgs(tail, options.copy(masterHost = value))
     case "--master-port" :: value :: tail => parseArgs(tail, options.copy(masterPort = value.toInt))
     case "--backend" :: value :: tail => parseArgs(tail, options.copy(backend = value.trim.toLowerCase))
+    case "--ub-transport" :: value :: tail =>
+      require(value.trim.equalsIgnoreCase("real"), "--ub-transport must be real")
+      parseArgs(tail, options)
     case "--wire-role" :: value :: tail => parseArgs(tail, options.copy(wireRole = value.trim.toLowerCase))
     case "--wire-path" :: value :: tail => parseArgs(tail, options.copy(wirePath = value))
     case "--ub-control-port" :: value :: tail => parseArgs(tail, options.copy(ubControlPort = value.toInt))
     case "--ub-device" :: value :: tail => parseArgs(tail, options.copy(ubDevice = value))
     case "--arena-bytes" :: value :: tail => parseArgs(tail, options.copy(arenaBytes = value.toInt))
     case "--arena-count" :: value :: tail => parseArgs(tail, options.copy(arenaCount = value.toInt))
+    case "--queue-depth" :: value :: tail => parseArgs(tail, options.copy(queueDepth = value.toInt))
+    case "--chunk-size" :: value :: tail => parseArgs(tail, options.copy(chunkSize = value.toInt))
     case "--lease-timeout-ms" :: value :: tail => parseArgs(tail, options.copy(leaseTimeoutMs = value.toInt))
     case "--test-read-delay-ms" :: value :: tail => parseArgs(tail, options.copy(testReadDelayMs = value.toInt))
     case "--timeout-ms" :: value :: tail => parseArgs(tail, options.copy(timeoutMs = value.toLong))
